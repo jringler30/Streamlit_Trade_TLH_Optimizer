@@ -30,9 +30,8 @@ from typing import List, Dict, Tuple, Any, Optional, Set
 from scipy import stats as sp_stats
 import warnings
 
-# Graceful import: the optimizer module is optional. When deployed without it
-# (e.g., Streamlit Cloud with minimal deps), the app still works — just without
-# the MSBA v1 tax-aware simulation section.
+
+#MSBA v1 tax-aware simulation section.
 try:
     from optimizer_msba_v1_engine import run_optimizer_simulation
     _OPTIMIZER_AVAILABLE = True
@@ -45,8 +44,7 @@ st.set_page_config(
     layout="wide",
 )
 
-# The VISE dark theme CSS is injected here. If ui_style.py is missing (e.g., in
-# a stripped-down deployment), the app falls back to default Streamlit styling.
+# app falls back to default Streamlit styling.
 try:
     from ui_style import inject_site_css, render_hero
     inject_site_css()
@@ -58,12 +56,16 @@ import gdown
 from pathlib import Path
 
 # Price data is cached to /tmp so Streamlit Cloud doesn't re-download on every
-# rerun. The parquet format keeps load times fast (~1–2s for the full dataset).
+# rerun. The parquet format keeps load times fast
 DATA_PATH = Path("/tmp/price_data.parquet")
 FILE_ID = "1pMQ817V05j4RK0vqJcVkBMmOBK5zRrug"
 GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 
 
+# @st.cache_data ensures this only runs once per Streamlit session. The
+# download is skipped entirely if the file already exists on disk from a
+# previous run. On Streamlit Cloud, /tmp persists across reruns within the
+# same container but is wiped on cold restarts.
 @st.cache_data(show_spinner=True)
 def ensure_data():
     if not DATA_PATH.exists():
@@ -123,7 +125,13 @@ def prepare_price_data(df: pd.DataFrame, price_field: str = "PRICECLOSE") -> pd.
     Clean raw price data for use by all engine functions.
 
     Filters to active trading items only (status 1 = active, 15 = suspended-but-valid).
-    This runs once at app startup and the result is cached by Streamlit.
+    Status 15 is kept because suspended instruments may still have valid historical
+    prices needed for backtesting. All other statuses (delisted, errored, etc.) are
+    excluded to avoid stale or unreliable price data.
+
+    The sort by (ticker, date) is critical: get_ticker_prices relies on iloc[0] and
+    iloc[-1] to find the first/last price in a date range, which only works correctly
+    on sorted data. This function runs once at app startup via @st.cache_data.
     """
     df = df.copy()
     df["PRICEDATE"] = pd.to_datetime(df["PRICEDATE"], errors="coerce")
@@ -143,8 +151,17 @@ def get_ticker_prices(ticker_df, ticker, start_date, end_date, price_field):
     """
     Find the nearest valid trading-day prices for a single ticker within
     [start_date, end_date]. If the exact start/end date has no price data
-    (weekends, holidays), the date is shifted to the nearest available trading
-    day. Shifts are recorded as flags so the UI can warn users.
+    (weekends, holidays), the date is shifted to the nearest available trading day:
+      - Start date shifts FORWARD to the next available trading day
+      - End date shifts BACKWARD to the previous available trading day
+
+    This asymmetry is intentional: it guarantees the actual measurement window
+    falls entirely within the user's requested window, never extending beyond it.
+    Shifts are recorded as flags so the UI can warn users about date adjustments.
+
+    Returns a dict with price data on success, or {"error": ...} on failure.
+    The caller is responsible for handling the error case (typically by dropping
+    the ticker and re-normalizing weights).
     """
     flags = []
     on_or_after = ticker_df[ticker_df["PRICEDATE"] >= start_date]
@@ -243,13 +260,23 @@ def calculate_portfolio_returns(
             "Shares": round(shares, 4),
             "Start Value": round(cost, 2),
             "End Value": round(end_value, 2),
+            # Per-asset return: pure price appreciation (end_price/start_price - 1).
+            # This is independent of allocation size — same for $1K or $100K invested.
             "Return": round((r["end_price"] / r["start_price"]) - 1, 6),
+            # Dollar gain: absolute P&L for this position at the allocated capital level
             "Gain ($)": round(end_value - cost, 2),
+            # Percentage gain: same as Return when fractional shares are used, but
+            # can differ slightly with whole shares due to cash residual not being invested
             "Gain (%)": round((end_value - cost) / cost, 6) if cost else 0,
             "Flags": "; ".join(r["flags"]) if r["flags"] else "OK",
         })
     holdings_df = pd.DataFrame(holdings_data)
+    # Portfolio end value includes cash residual (if whole-shares mode is on).
+    # This ensures the total return accounts for ALL initial capital, not just
+    # the portion deployed in shares.
     port_end = holdings_df["End Value"].sum() + total_cash_residual
+    # The summary dict is the primary output contract consumed by the Streamlit
+    # dashboard for KPI cards, and by downstream engines as a reference point.
     summary = {
         "portfolio_start_value": initial_capital,
         "portfolio_end_value": round(port_end, 2),
@@ -283,7 +310,10 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
     tickers = holdings["Ticker"].tolist()
     clean = clean[clean["TICKERSYMBOL"].isin(tickers)]
 
-    # Build one time series per ticker, then join them on date
+    # Build one time series per ticker, then join them on date.
+    # Each ticker becomes a column of dollar values (shares × price).
+    # We build per-ticker first because different tickers may have different
+    # trading calendars — an ETF might trade on a day when a bond fund doesn't.
     frames = []
     for _, row in holdings.iterrows():
         tk = row["Ticker"]
@@ -297,11 +327,19 @@ def build_daily_series(df, holdings, initial_capital, price_field="PRICECLOSE"):
         # Convert from price → dollar value held
         tk_prices[tk] = tk_prices[tk] * shares
         frames.append(tk_prices)
+
+    # Outer join preserves all dates from all tickers. ffill then bfill ensures
+    # no NaN gaps — if ticker A trades on Monday but ticker B doesn't, B's
+    # Friday close carries forward. bfill handles the edge case where a ticker's
+    # data starts later than others.
     daily = frames[0]
     for f in frames[1:]:
         daily = daily.join(f, how="outer")
     daily = daily.sort_index().ffill().bfill()
     daily["Portfolio Value"] = daily[tickers].sum(axis=1)
+    # Cost basis is a flat horizontal line at initial_capital. This is by design —
+    # in buy-and-hold, no additional capital is deployed, so the gap between
+    # Portfolio Value and Cost Basis represents the unrealized gain/loss over time.
     daily["Cost Basis"] = initial_capital
 
     # Per-ticker cumulative return series (used for the return breakdown chart)
@@ -330,7 +368,12 @@ def build_prices_wide(df, tickers, start_date, end_date, price_field="PRICECLOSE
         & (df["PRICEDATE"] <= pd.Timestamp(end_date))
     )
     subset = df.loc[mask, ["TICKERSYMBOL", "PRICEDATE", price_field]].copy()
+    # De-duplicate before pivoting — if the source data has multiple rows for the
+    # same ticker+date (e.g., from different exchanges), pivot() would raise an error.
     subset = subset.drop_duplicates(subset=["TICKERSYMBOL", "PRICEDATE"])
+    # Pivot from long format (one row per ticker per day) to wide format (one column
+    # per ticker, one row per day). This is the format both simulation engines need
+    # for fast random access by date: prices_wide.loc[date, ticker].
     wide = subset.pivot(index="PRICEDATE", columns="TICKERSYMBOL", values=price_field)
     # ffill then bfill handles missing dates (holidays, delistings) so every
     # ticker has a price for every trading day in the range
@@ -360,6 +403,9 @@ def _get_rebalance_dates(trading_dates, freq):
         return set(dates[1:])
     rebal_set = set()
     if freq == "Weekly":
+        # Track ISO week number. Rebalance fires on the first trading day where
+        # the week number changes. Year tracking prevents false triggers at
+        # year boundaries (ISO week 1 of new year vs week 52 of old year).
         prev_week = dates[0].isocalendar()[1]
         prev_year = dates[0].year
         for dt in dates[1:]:
@@ -377,6 +423,10 @@ def _get_rebalance_dates(trading_dates, freq):
                 prev_month = dt.month
                 prev_year = dt.year
     elif freq == "Quarterly":
+        # Only rebalance at the start of calendar quarters (Jan/Apr/Jul/Oct).
+        # The prev_month tracking outside the quarter_months check is necessary
+        # to avoid re-triggering: without it, every trading day in January would
+        # match the condition if we only checked dt.month != prev_month.
         quarter_months = {1, 4, 7, 10}
         prev_month = dates[0].month
         prev_year = dates[0].year
@@ -437,7 +487,10 @@ def build_rebalanced_series(prices_wide, target_weights, initial_capital, rebala
         for tk in tickers:
             ticker_values_arr[tk][i] = tv[tk]
 
-        # Calendar rebalance: check if today is a scheduled rebalance date
+        # Calendar rebalance: check if today is a scheduled rebalance date.
+        # The "needs_rebalance" check avoids a rebalance event (and turnover
+        # accounting) when the portfolio is already at target — this can happen
+        # with Daily frequency after a day where all assets moved in lockstep.
         if dt in rebal_dates and total_value > 0:
             day_turnover = 0.0
             needs_rebalance = False
@@ -448,6 +501,9 @@ def build_rebalanced_series(prices_wide, target_weights, initial_capital, rebala
                     break
             if needs_rebalance:
                 rebalance_count += 1
+                # Rebalance all assets simultaneously: compute target dollar value
+                # for each ticker, convert to shares at today's price, and record
+                # the trade volume for turnover calculation.
                 for tk in tickers:
                     target_value = target_weights[tk] * total_value
                     new_shares = target_value / prices_wide.loc[dt, tk]
@@ -464,9 +520,15 @@ def build_rebalanced_series(prices_wide, target_weights, initial_capital, rebala
     turnover_proxy = (total_turnover_dollars / avg_port_value) if avg_port_value > 0 else 0.0
     rebal_daily = pd.DataFrame(index=dates)
     rebal_daily.index.name = "PRICEDATE"
+    # Per-ticker columns use "(Rebal)" suffix to distinguish from the buy-and-hold
+    # daily series which uses bare ticker names. This prevents column collisions
+    # when both series are displayed side by side.
     for tk in tickers:
         rebal_daily[f"{tk} (Rebal)"] = ticker_values_arr[tk]
     rebal_daily["Portfolio Value"] = portfolio_values
+    # rebal_stats is the summary contract consumed by the metrics table and KPI cards.
+    # turnover_proxy is dimensionless (dollars traded / average portfolio value) so
+    # it's comparable across different capital amounts and time periods.
     rebal_stats = {
         "rebalance_count": rebalance_count,
         "turnover_proxy": round(turnover_proxy, 4),
@@ -556,6 +618,11 @@ def apply_rebalance_full(
     Full rebalance: set ALL assets to exact target weights regardless of which
     ones breached. This is the simpler and more common institutional approach —
     it ensures the portfolio is always at target after a rebalance event.
+
+    Returns (new_shares, turnover) where turnover is the sum of absolute dollar
+    values of all trades. Note: this is a mathematical position reset, not a
+    real trade execution — there are no tax lots, realized gains, or cash
+    accounting. Compare with the MSBA v1 optimizer which does all of those.
     """
     turnover = 0.0
     new_shares = {}
@@ -596,8 +663,14 @@ def apply_rebalance_partial(
     tickers = list(target_weights.keys())
     current_weights = compute_weights(shares, prices)
     breached_set = set(breached_tickers)
+    # Calculate how much weight budget remains for non-breached assets after
+    # the breached ones are set to their exact target weights.
+    # Example: if SPY (50% target) breached, remaining_budget = 0.50 for AGG + QQQ.
     breached_target_sum = sum(target_weights[tk] for tk in breached_set)
     remaining_budget = 1.0 - breached_target_sum
+    # Non-breached assets are scaled proportionally to their CURRENT weights
+    # (not targets). This preserves relative allocation among the "healthy" assets
+    # rather than forcing them to target, which would defeat the purpose of partial.
     non_breached_current_sum = sum(
         current_weights.get(tk, 0.0) for tk in tickers if tk not in breached_set
     )
@@ -714,8 +787,10 @@ def build_threshold_rebalanced_series(
         for tk in tickers:
             ticker_values_arr[tk][i] = shares[tk] * prices_today[tk]
 
-        # Record drift for every day (used in diagnostics regardless of whether
-        # a rebalance occurs)
+        # Record drift for every day regardless of whether a rebalance occurs.
+        # This powers the drift diagnostics section: histograms, P95, breach %,
+        # and the drift time-series chart. Computing it unconditionally means
+        # we capture drift behavior between rebalance events, not just at trigger points.
         current_weights = compute_weights(shares, prices_today)
         drift = compute_drift(current_weights, target_weights, drift_mode)
         for tk in tickers:
@@ -762,7 +837,12 @@ def build_threshold_rebalanced_series(
             pending_breached_tickers = []
             pending_max_drift = 0.0
 
-        # STEP 2: Calendar rebalance (independent of threshold — both can fire same day)
+        # STEP 2: Calendar rebalance (independent of threshold — both can fire same day).
+        # Calendar always uses full rebalance (all assets to target) regardless of
+        # the rebalance_action setting, which only applies to threshold triggers.
+        # The did_rebalance_today flag prevents double-counting: if both threshold
+        # and calendar fire on the same day, the combined event counts as one in
+        # rebalance_count but both are tracked separately in their specific counters.
         if enable_calendar and dt in calendar_dates and total_value > 0:
             cw_now = compute_weights(shares, prices_today)
             needs_rebal = any(abs(cw_now.get(tk, 0) - target_weights[tk]) > 1e-10 for tk in tickers)
@@ -790,6 +870,9 @@ def build_threshold_rebalanced_series(
 
         # STEP 3: End-of-day threshold check — if breached, schedule for next day.
         # We skip the last day since there's no next day to execute on.
+        # Note: this checks post-rebalance weights if a rebalance happened today,
+        # so a calendar rebalance that brings everything to target will NOT
+        # immediately trigger a threshold breach on the same day.
         if enable_threshold and i < n_days - 1:
             cw_post = compute_weights(shares, prices_today)
             drift_post = compute_drift(cw_post, target_weights, drift_mode)
@@ -855,13 +938,19 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
     final = daily_values[-1]
     total_return = final / initial_capital - 1
 
-    # CAGR: annualized geometric return
+    # CAGR: annualized geometric return. Uses 252 trading days = 1 year.
+    # The formula (final/initial)^(1/years) - 1 correctly compounds over
+    # multi-year periods. For sub-year periods it extrapolates (which can
+    # overstate returns for very short periods — interpret with caution).
     years = n / 252.0
     if years > 0 and final > 0 and initial_capital > 0:
         cagr = (final / initial_capital) ** (1 / years) - 1
     else:
         cagr = 0.0
 
+    # Daily returns: simple (not log) returns. np.diff gives day-over-day price
+    # changes; dividing by the previous day's value converts to percentage returns.
+    # ddof=1 uses Bessel's correction for an unbiased sample standard deviation.
     daily_rets = np.diff(daily_values) / daily_values[:-1]
     ann_vol = np.std(daily_rets, ddof=1) * np.sqrt(252) if len(daily_rets) > 1 else 0.0
 
@@ -873,21 +962,33 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
     drawdowns = (daily_values - running_max) / running_max
     max_dd = float(np.min(drawdowns))
 
-    # Higher-moment statistics (V4) — require minimum samples to be meaningful
+    # Higher-moment statistics (V4) — require minimum samples to be meaningful.
+    # Skewness: negative values indicate the distribution has a longer left tail
+    # (more frequent large losses). Most equity portfolios show slight negative skew.
+    # Kurtosis (excess/Fisher): values > 0 mean heavier tails than a normal
+    # distribution — more extreme events than a bell curve would predict.
     skewness = float(sp_stats.skew(daily_rets)) if len(daily_rets) > 2 else 0.0
     kurtosis = float(sp_stats.kurtosis(daily_rets, fisher=True)) if len(daily_rets) > 3 else 0.0
+    # Average drawdown: the mean of ALL daily drawdowns (most of which are small).
+    # Unlike max drawdown which is a single worst case, this captures the "typical"
+    # underwater experience. A strategy with low max DD but high avg DD spends a
+    # lot of time slightly underwater — important for investor psychology.
     avg_drawdown = float(np.mean(drawdowns))
 
     # Tracking error and information ratio: only computed when a benchmark
-    # (typically buy-and-hold) is provided
+    # (typically buy-and-hold) is provided. These measure active return quality:
+    # TE = how much the strategy's returns deviate from the benchmark day-to-day
+    # IR = how efficiently the strategy generates excess return per unit of deviation
+    # A high IR (> 0.5) suggests the rebalancing strategy adds consistent value.
     tracking_error = 0.0
     information_ratio = 0.0
     if benchmark_values is not None and len(benchmark_values) == n:
         bm_rets = np.diff(benchmark_values) / benchmark_values[:-1]
+        # Active returns = strategy daily returns minus benchmark daily returns
         active_rets = daily_rets - bm_rets
         tracking_error = float(np.std(active_rets, ddof=1) * np.sqrt(252)) if len(active_rets) > 1 else 0.0
         if tracking_error > 1e-12:
-            # Annualize active return: daily mean × 252
+            # Annualize active return: daily mean × 252 trading days
             ann_active_mean = float(np.mean(active_rets) * 252)
             information_ratio = ann_active_mean / tracking_error
 
@@ -1043,6 +1144,16 @@ global_tax_rates = {"st_rate": global_st_rate, "lt_rate": global_lt_rate}
 # ================================================================
 # Rebalancing controls
 # ================================================================
+# The rebalancing sidebar uses a cascading enable/disable pattern:
+# 1. "Enable Rebalancing Comparison" is the master switch — if off, no
+#    rebalancing UI appears and all rebalancing flags are False.
+# 2. Under that, calendar and threshold can be independently toggled.
+# 3. Calendar frequency and "show all strategies" are disabled when
+#    calendar rebalancing is off.
+# 4. Threshold controls (drift mode, tolerance, cooldown) only appear
+#    when threshold is enabled.
+# This prevents invalid state combinations (e.g., threshold cooldown
+# configured but threshold itself disabled).
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Rebalancing")
 
@@ -1106,6 +1217,12 @@ else:
 # ================================================================
 # MSBA v1 OPTIMIZER SIDEBAR
 # ================================================================
+# The optimizer sidebar only appears if the module imported successfully.
+# When the optimizer toggle is off, we still define default values for
+# opt_tlh_threshold and opt_div_handling so the rest of the code doesn't
+# need to check enable_optimizer before accessing these variables.
+# Note: V4 removed the separate optimizer tax rate inputs — they now use
+# the universal global_tax_rates defined above.
 if _OPTIMIZER_AVAILABLE:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### \U0001f9e0 Optimizer MSBA v1")
@@ -1133,6 +1250,10 @@ run_btn = st.sidebar.button("\U0001f680 Calculate Returns", use_container_width=
 # ================================================================
 #  MAIN PAGE
 # ================================================================
+# Everything below this point only executes when the user clicks "Calculate Returns".
+# st.stop() is used at multiple guard points to halt rendering early if there's
+# an error — this prevents confusing partial UI states where some charts render
+# but others fail.
 
 if _STYLE_LOADED:
     render_hero(
@@ -1194,6 +1315,10 @@ st.line_chart(chart1_df, color=["#1a73e8", "#888888"], use_container_width=True,
 
 gain_area = daily[["Portfolio Value", "Cost Basis"]].copy()
 gain_area["Unrealized Gain/Loss ($)"] = gain_area["Portfolio Value"] - gain_area["Cost Basis"]
+# Color the gain/loss area chart green for net profit, red for net loss.
+# The color is determined by the FINAL value (gain_dollars), not per-day — so
+# the entire area is one color. This is a simplification; a more complex
+# implementation could use green above zero and red below.
 st.area_chart(
     _safe_chart_cols(gain_area[["Unrealized Gain/Loss ($)"]]),
     color=["#34a853"] if gain_dollars >= 0 else ["#ea4335"],
@@ -1291,18 +1416,26 @@ if enable_rebalancing:
     if not strategy_results and not enable_threshold_rebal and not enable_calendar_rebal:
         st.info("Enable at least one rebalancing strategy to see comparison results.")
     elif strategy_results:
-        # Align all strategy series to the same date index for apples-to-apples comparison
+        # Align all strategy series to the same date index for apples-to-apples comparison.
+        # The reindex + dropna ensures we only compare days where ALL strategies have data.
+        # This handles edge cases where the buy-and-hold series has slightly different
+        # date coverage than the rebalanced series (due to the outer join in build_daily_series).
         comparison_df = pd.DataFrame(index=prices_wide.index)
         comparison_df.index.name = "PRICEDATE"
+        # Buy-and-hold comes from the daily series built earlier; reindex aligns it
+        # to the wide price matrix's trading days.
         bh_values = daily["Portfolio Value"].reindex(comparison_df.index)
         comparison_df["Buy & Hold"] = bh_values
         for label, (rd, rs) in strategy_results.items():
             comparison_df[label] = rd["Portfolio Value"].reindex(comparison_df.index)
         comparison_df = comparison_df.dropna()
 
-        # Enhanced metrics table: each strategy benchmarked against buy-and-hold
+        # Enhanced metrics table: each strategy benchmarked against buy-and-hold.
+        # Buy-and-hold is computed with benchmark_values=None (no self-tracking-error)
+        # while all other strategies pass bh_vals_arr as benchmark for TE/IR calculation.
         bh_vals_arr = comparison_df["Buy & Hold"].values
         bh_metrics = compute_strategy_metrics(bh_vals_arr, float(initial_capital), benchmark_values=None)
+        # Manually inject rebalancing-specific fields that compute_strategy_metrics doesn't produce
         bh_metrics["rebalance_count"] = 0
         bh_metrics["turnover_proxy"] = 0.0
 
@@ -1348,7 +1481,11 @@ if enable_rebalancing:
         metrics_df = pd.DataFrame(metrics_rows)
         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
 
-        # KPI cards: headline comparison of first strategy vs buy-and-hold
+        # KPI cards: headline comparison of first strategy vs buy-and-hold.
+        # "Primary" strategy is the first one in the results dict — this is the
+        # selected calendar frequency, or threshold, or the first of "all strategies".
+        # The "advantage" card shows the dollar/percentage delta, making it easy to
+        # see at a glance whether the rebalancing strategy helped or hurt.
         primary_label = list(strategy_results.keys())[0]
         _, primary_stats = strategy_results[primary_label]
         bh_final = bh_vals_arr[-1]
@@ -1364,10 +1501,16 @@ if enable_rebalancing:
 
         # Portfolio value chart with strategy toggle
         st.markdown("#### Portfolio Value Over Time")
+        # Color mapping: each strategy type gets a distinct color for visual clarity.
+        # Blue for B&H (the stable baseline), warm colors for calendar frequencies
+        # (orange/green/purple/red in order of increasing interval), and amber for
+        # threshold to distinguish it from all calendar strategies.
         freq_color_map = {"Daily": "#e8710a", "Weekly": "#34a853", "Monthly": "#9c27b0", "Quarterly": "#ea4335"}
         threshold_color = "#ffab00"
 
-        # Build a color map keyed by strategy label for consistent coloring
+        # Build a color map keyed by strategy label for consistent coloring.
+        # Strategy labels follow patterns: "Buy & Hold", "Rebal: Monthly", "Threshold",
+        # or "Cal(Monthly)+Thresh" — the prefix determines which color pool to use.
         _all_strat_labels = list(comparison_df.columns)
         _color_map = {}
         _color_map["Buy & Hold"] = "#1a73e8"
@@ -1395,13 +1538,17 @@ if enable_rebalancing:
 
         strategy_colors = [_color_map.get(c, "#666666") for c in comparison_df.columns]
 
-        # Drawdown chart: shows peak-to-trough declines over time for all strategies
+        # Drawdown chart: shows peak-to-trough declines over time for all strategies.
+        # Drawdown at day i = (value_i - max_value_up_to_i) / max_value_up_to_i × 100.
+        # Values are always ≤ 0 (0% = at peak, -10% = 10% below peak).
+        # Area chart makes periods of drawdown visually prominent.
         show_drawdown = st.checkbox("Show Drawdown Chart", value=False)
         if show_drawdown:
             st.markdown("#### Drawdown Over Time")
             dd_df = pd.DataFrame(index=comparison_df.index)
             for col in comparison_df.columns:
                 vals = comparison_df[col].values
+                # Running max = the highest portfolio value seen up to each point
                 rm = np.maximum.accumulate(vals)
                 dd_df[col] = ((vals - rm) / rm) * 100
             st.area_chart(_safe_chart_cols(dd_df), color=strategy_colors, use_container_width=True, height=300)
@@ -1468,6 +1615,9 @@ if enable_rebalancing:
                 ds4.metric("Days Breached (%)", f"{breach_pct:.1f}%")
 
                 # Histogram of daily drift values — bin count scales with data length
+                # to avoid either too few bins (hiding distribution shape with <1yr data)
+                # or too many (noisy with multi-year data). The 15-30 range works well
+                # for typical simulation lengths of 252-1260 trading days.
                 n_bins = min(30, max(15, len(drift_pct) // 15))
                 counts, bin_edges = np.histogram(drift_pct, bins=n_bins)
                 bin_labels = [
@@ -1530,16 +1680,32 @@ if enable_rebalancing:
 # ================================================================
 # MSBA v1 OPTIMIZER SECTION
 # ================================================================
-# This section runs two parallel simulations through the tax-aware engine:
-# 1. Static: buy-and-hold with TLH only (no rebalancing)
-# 2. Optimized: scheduled rebalancing + TLH + tax-aware lot disposal
-# The comparison shows the dollar benefit of active tax management.
+# This section runs two parallel simulations through the tax-aware engine
+# from optimizer_msba_v1_engine.py:
+#   1. Static (static=True): buy-and-hold with TLH only (no rebalancing).
+#      This isolates the value of tax-loss harvesting alone.
+#   2. Optimized (static=False): scheduled rebalancing + TLH + tax-aware lot disposal.
+#      This shows the combined benefit of active management + TLH.
+#
+# Both simulations use IDENTICAL parameters (same tickers, weights, dates, tax
+# rates, TLH threshold) — the only difference is the static flag. This ensures
+# the comparison is apples-to-apples: the "Optimizer Advantage" KPI card
+# directly shows the incremental value of rebalancing on top of TLH.
+#
+# Key architectural difference from the base engine: the optimizer creates actual
+# Portfolio objects with lot-level accounting, cash balances, and realized gain
+# tracking — it's a portfolio ACCOUNTING engine, not just a valuation engine.
 
 if enable_optimizer:
     st.subheader("\U0001f9e0 Optimizer MSBA v1 \u2014 Tax-Aware Simulation")
 
-    # Attempt to load dividend data. The dividend CSV uses TRADINGITEMID as the
-    # key, so we need to map it to TICKERSYMBOL using the price dataset's mapping.
+    # Attempt to load dividend data. The dividend CSV may not exist in all
+    # deployments (it's optional — the optimizer runs fine without it, just
+    # without dividend processing). If present, it requires a TICKERSYMBOL
+    # column or a TRADINGITEMID column that can be mapped to ticker symbols
+    # using the price dataset. The TRADINGITEMID → TICKERSYMBOL mapping is
+    # necessary because the raw dividend data from Capital IQ uses
+    # TRADINGITEMID as the primary key, not the human-readable ticker symbol.
     _div_df = None
     try:
         import os
@@ -1561,10 +1727,13 @@ if enable_optimizer:
     except Exception:
         _div_df = None
 
-    _opt_tax_rates = global_tax_rates  # V4: use universal tax rates
+    _opt_tax_rates = global_tax_rates  # V4: use universal tax rates (not optimizer-specific)
     _opt_reinvest = opt_div_handling == "Reinvest dividends"
     _opt_tickers = holdings["Ticker"].tolist()
     _opt_weights = holdings["Weight"].tolist()
+    # Pass the calendar frequency to the optimizer. If calendar rebalancing is
+    # disabled in the main panel, pass "None" so the optimizer runs as pure
+    # buy-and-hold (the static run) or TLH-only (both runs skip rebalancing).
     _opt_rebal_freq = selected_freq if enable_calendar_rebal else "None"
 
     with st.spinner("Running MSBA v1 Static simulation..."):
@@ -1656,6 +1825,11 @@ if enable_optimizer:
 # ================================================================
 #  HOLDINGS TABLE
 # ================================================================
+# Format the holdings DataFrame for human-readable display. The raw holdings
+# DataFrame has numeric values; here we convert to formatted strings with
+# currency symbols, percentage signs, and proper alignment. This is purely
+# a presentation layer — the underlying data has already been consumed by
+# all engine functions above.
 
 st.subheader("Per-Holding Detail")
 
