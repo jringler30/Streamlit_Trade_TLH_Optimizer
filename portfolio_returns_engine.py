@@ -1230,10 +1230,10 @@ if enable_threshold_rebal:
         "Rebalance Action", ["Full", "Partial"],
         help="Full: rebalance ALL assets to target. Partial: only trade breached assets, scale others.",
     )
-    default_tolerance_pct = st.sidebar.slider(
-        "Default Drift Tolerance (%)", min_value=0.5, max_value=20.0,
-        value=5.0, step=0.5, key="thresh_tol",
-        help="Default tolerance for all assets. Override per-asset in the main panel.",
+    default_tolerance_pct = st.sidebar.number_input(
+        "Default Drift Tolerance (%)", min_value=0.5, max_value=50.0,
+        value=5.0, step=0.5, format="%.1f", key="thresh_tol",
+        help="Default tolerance for all assets. Override per-asset below.",
     )
     cooldown_days = st.sidebar.number_input(
         "Cooldown (trading days)", min_value=0, max_value=60, value=0, step=1,
@@ -2064,6 +2064,14 @@ if rebal["enabled"]:
                     )
 
             with st.expander("\U0001f4cb Full Rebalance Event Log"):
+                if _elog_sheets:
+                    st.download_button(
+                        label="\u2b07 Download Full Event Log (.xlsx)",
+                        data=to_excel_bytes(_elog_sheets),
+                        file_name="rebalance_event_log_full.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_event_log",
+                    )
                 for _lbl_e, _log_df_e in event_logs.items():
                     st.markdown(f"**{_lbl_e}**")
                     if not _log_df_e.empty:
