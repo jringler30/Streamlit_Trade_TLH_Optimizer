@@ -85,15 +85,30 @@ class TaxEngine:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Portfolio (simplified — no transaction costs / slippage for Streamlit MVP)
+# Default transaction cost configuration
+# commission_per_trade_bps: flat execution cost in bps of trade value
+# slippage_bps: market impact / price improvement slippage in bps
+# bid_ask_bps: half-spread cost in bps (round-trip is 2× for buys+sells)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Portfolio:
-    """Trade-driven portfolio with lot tracking, realized gain accounting, and tax."""
+DEFAULT_COST_CONFIG: Dict[str, float] = {
+    "commission_bps": 5.0,    # ~$0.005/share on a $100 stock = 5 bps
+    "slippage_bps": 5.0,      # 5 bps market impact
+    "bid_ask_bps": 2.0,       # 2 bps half-spread (one-way)
+}
 
-    def __init__(self, initial_cash: float, tax_engine: TaxEngine):
+
+class Portfolio:
+    """Trade-driven portfolio with lot tracking, realized gain accounting, tax, and transaction costs."""
+
+    def __init__(self, initial_cash: float, tax_engine: TaxEngine,
+                 cost_config: Optional[Dict[str, float]] = None):
         self.cash = initial_cash
         self.tax = tax_engine
+
+        # Merge provided config with defaults so callers only need to override what they change
+        cfg = {**DEFAULT_COST_CONFIG, **(cost_config or {})}
+        self._cost_rate = (cfg["commission_bps"] + cfg["slippage_bps"] + cfg["bid_ask_bps"]) / 10_000.0
 
         self._lot_ctr = 0
         self._trd_ctr = 0
@@ -108,6 +123,8 @@ class Portfolio:
         self._realized: List[dict] = []
         self._taxes: List[dict] = []
         self.total_tax_paid: float = 0.0
+        self.total_commission_and_slippage: float = 0.0  # cumulative execution costs
+        self.total_losses_harvested: float = 0.0          # absolute value of harvested losses
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -146,20 +163,25 @@ class Portfolio:
     # ── buy ───────────────────────────────────────────────────────────────────
 
     def buy(self, date, ticker: str, shares: float, price: float, source: str = "BUY"):
-        cost = shares * price
-        if cost > self.cash + 1e-6:
-            # Clamp to what cash allows
-            shares = self.cash / price
-            cost = shares * price
+        gross = shares * price
+        exec_cost = gross * self._cost_rate  # commission + slippage + bid-ask on buys
+        total_cash_needed = gross + exec_cost
+        if total_cash_needed > self.cash + 1e-6:
+            # Back-solve shares from available cash including execution cost
+            shares = self.cash / (price * (1 + self._cost_rate))
+            gross = shares * price
+            exec_cost = gross * self._cost_rate
+            total_cash_needed = gross + exec_cost
         if shares < 1e-12:
             return
 
-        self.cash -= cost
+        self.cash -= total_cash_needed
+        self.total_commission_and_slippage += exec_cost
 
         lid = self._nid("L", "_lot_ctr")
         lot = {
             "lot_id": lid, "ticker": ticker, "open_date": date,
-            "shares": shares, "cost_basis": price, "total_cost": cost, "source": source,
+            "shares": shares, "cost_basis": price, "total_cost": gross, "source": source,
         }
         idx = len(self._lots)
         self._lots.append(lot)
@@ -169,7 +191,8 @@ class Portfolio:
         self._trades.append({
             "trade_id": self._nid("T", "_trd_ctr"), "trade_date": date,
             "ticker": ticker, "action": source, "shares": shares,
-            "price": price, "gross_value": cost, "net_cash_impact": -cost,
+            "price": price, "gross_value": gross,
+            "exec_cost": round(exec_cost, 4), "net_cash_impact": -(gross + exec_cost),
         })
 
     # ── sell ──────────────────────────────────────────────────────────────────
@@ -181,7 +204,10 @@ class Portfolio:
         if shares < 1e-12:
             return
 
-        proceeds_total = shares * price
+        gross_proceeds = shares * price
+        exec_cost = gross_proceeds * self._cost_rate  # slippage + spread reduces net proceeds
+        net_proceeds = gross_proceeds - exec_cost
+        self.total_commission_and_slippage += exec_cost
 
         if lot_selection == "TAX_OPTIMAL":
             lots = self._sorted_lots_for_sell(ticker, price, date)
@@ -212,18 +238,20 @@ class Portfolio:
                 self.cash -= tax
                 self.total_tax_paid += tax
                 self._taxes.append({"date": date, "event_id": eid, "amount": tax})
+            if gain < 0:
+                self.total_losses_harvested += abs(gain)
 
             lot["shares"] -= sold
             lot["total_cost"] = lot["shares"] * lot["cost_basis"]
             remaining -= sold
 
-        self.cash += proceeds_total
+        self.cash += net_proceeds  # net of execution costs
 
         self._trades.append({
             "trade_id": self._nid("T", "_trd_ctr"), "trade_date": date,
             "ticker": ticker, "action": "SELL", "shares": shares,
-            "price": price, "gross_value": proceeds_total,
-            "net_cash_impact": proceeds_total,
+            "price": price, "gross_value": gross_proceeds,
+            "exec_cost": round(exec_cost, 4), "net_cash_impact": net_proceeds,
         })
 
     # ── dividend ──────────────────────────────────────────────────────────────
@@ -312,6 +340,7 @@ def run_optimizer_simulation(
     initial_capital: float = 100_000.0,
     price_field: str = "PRICECLOSE",
     static: bool = False,
+    cost_config: Optional[Dict[str, float]] = None,
 ) -> dict:
     """
     Run the MSBA v1 tax-aware portfolio simulation.
@@ -381,7 +410,7 @@ def run_optimizer_simulation(
         st_rate=tax_rates.get("st_rate", 0.35),
         lt_rate=tax_rates.get("lt_rate", 0.20),
     )
-    pf = Portfolio(initial_capital, tax_eng)
+    pf = Portfolio(initial_capital, tax_eng, cost_config=cost_config)
 
     weight_map = dict(zip(tickers, weights))
 
@@ -459,9 +488,13 @@ def run_optimizer_simulation(
     nav_series = pd.Series(nav_arr, index=trading_dates, name="NAV")
     nav_series.index.name = "PRICEDATE"
 
+    cfg = {**DEFAULT_COST_CONFIG, **(cost_config or {})}
     return {
         "nav_series": nav_series,
         "trades_df": pf.trades_df(),
         "realized_df": pf.realized_df(),
         "tax_paid_total": pf.total_tax_paid,
+        "losses_harvested": round(pf.total_losses_harvested, 2),
+        "transaction_costs_total": round(pf.total_commission_and_slippage, 2),
+        "cost_config": cfg,
     }
