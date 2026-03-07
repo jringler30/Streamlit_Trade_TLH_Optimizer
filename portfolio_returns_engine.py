@@ -1245,6 +1245,20 @@ else:
     default_tolerance_pct = 5.0
     cooldown_days = 0
 
+# Per-asset tolerance overrides (sidebar, so they're captured at compute time)
+if enable_threshold_rebal:
+    with st.sidebar.expander("📐 Per-Asset Drift Tolerances"):
+        st.caption("Override default tolerance per ticker. Re-run to apply.")
+        _seen_tickers: set = set()
+        for _tk_input in ticker_inputs:
+            if _tk_input and _tk_input not in _seen_tickers:
+                _seen_tickers.add(_tk_input)
+                st.number_input(
+                    f"{_tk_input} tolerance (%)", min_value=0.5, max_value=50.0,
+                    value=default_tolerance_pct, step=0.5,
+                    key=f"tol_sidebar_{_tk_input}", format="%.1f",
+                )
+
 # ================================================================
 # MSBA v1 OPTIMIZER SIDEBAR
 # ================================================================
@@ -1307,10 +1321,6 @@ run_btn = st.sidebar.button("\U0001f680 Calculate Returns", use_container_width=
 # ================================================================
 #  MAIN PAGE
 # ================================================================
-# Everything below this point only executes when the user clicks "Calculate Returns".
-# st.stop() is used at multiple guard points to halt rendering early if there's
-# an error — this prevents confusing partial UI states where some charts render
-# but others fail.
 
 if _STYLE_LOADED:
     render_hero(
@@ -1323,33 +1333,490 @@ else:
     st.title("\U0001f4ca Portfolio Returns Calculator")
     st.caption("Price-based returns engine")
 
-if not run_btn:
+# ----------------------------------------------------------------
+#  COMPUTE — runs only when the button is pressed.
+#  All results are stored in st.session_state["_r"] so they survive
+#  sidebar interactions without recomputing.
+# ----------------------------------------------------------------
+if run_btn:
+    weight_sum = sum(weight_inputs)
+    if weight_sum == 0:
+        st.error("All weights are zero. Please assign weights to at least one ticker.")
+        st.stop()
+
+    try:
+        _summary, _holdings = calculate_portfolio_returns(
+            df=df, tickers=ticker_inputs, weights=weight_inputs,
+            start_date=str(start_date), end_date=str(end_date),
+            initial_capital=float(initial_capital), price_field=price_field,
+            allow_cash_residual=allow_cash,
+        )
+    except ValueError as e:
+        st.error(f"**Error:** {e}")
+        st.stop()
+
+    _daily = build_daily_series(df, _holdings, float(initial_capital), price_field)
+    _tickers_used = _holdings["Ticker"].tolist()
+
+    # ── Portfolio Summary Stats ────────────────────────────────────────────
+    _bh_vals = _daily["Portfolio Value"].values
+    _bh_metrics = compute_strategy_metrics(_bh_vals, float(initial_capital))
+    _n_days = len(_bh_vals)
+
+    _summary_stats_rows = [
+        ("Period", f"{str(start_date)} → {str(end_date)}"),
+        ("Trading Days", f"{_n_days:,}"),
+        ("Initial Capital", f"${float(initial_capital):,.0f}"),
+        ("Final Value (B&H)", f"${_bh_vals[-1]:,.0f}"),
+        ("Total Return", f"{_bh_metrics['total_return']:+.2%}"),
+        ("CAGR", f"{_bh_metrics['cagr']:+.2%}"),
+        ("Annualized Volatility", f"{_bh_metrics['annualized_vol']:.2%}"),
+        ("Sharpe Ratio (Rf=0)", f"{_bh_metrics['sharpe']:.3f}"),
+        ("Max Drawdown", f"{_bh_metrics['max_drawdown']:.2%}"),
+        ("Avg Drawdown", f"{_bh_metrics['avg_drawdown']:.2%}"),
+        ("Calmar Ratio", f"{abs(_bh_metrics['cagr'] / _bh_metrics['max_drawdown']):.3f}" if _bh_metrics['max_drawdown'] != 0 else "—"),
+        ("Return Skewness", f"{_bh_metrics['skewness']:.3f}"),
+        ("Excess Kurtosis", f"{_bh_metrics['kurtosis']:.3f}"),
+    ]
+    _summary_df = pd.DataFrame(_summary_stats_rows, columns=["Metric", "Value (Buy & Hold)"])
+
+    # ── Allocation Drift ───────────────────────────────────────────────────
+    _final_values = {row["Ticker"]: row["End Value"] for _, row in _holdings.iterrows()}
+    _port_end_val = sum(_final_values.values())
+    _drift_rows = []
+    for _, row in _holdings.iterrows():
+        tk = row["Ticker"]
+        target_w = row["Weight"]
+        end_val = row["End Value"]
+        actual_w = end_val / _port_end_val if _port_end_val > 0 else 0.0
+        drift_abs = actual_w - target_w
+        _drift_rows.append({
+            "Ticker": tk,
+            "Target Weight": f"{target_w:.1%}",
+            "Actual Weight (End)": f"{actual_w:.1%}",
+            "Drift (pp)": f"{drift_abs:+.2%}",
+            "Drift Direction": "Overweight" if drift_abs > 0.005 else ("Underweight" if drift_abs < -0.005 else "On Target"),
+            "End Value ($)": f"${end_val:,.0f}",
+        })
+    _drift_df = pd.DataFrame(_drift_rows)
+
+    # ── Rebalancing ────────────────────────────────────────────────────────
+    _rebal: Dict[str, Any] = {"enabled": enable_rebalancing, "has_strategies": False}
+
+    if enable_rebalancing:
+        try:
+            _all_start = pd.to_datetime(_holdings["Start Date"]).min()
+            _all_end = pd.to_datetime(_holdings["End Date"]).max()
+            _prices_wide = build_prices_wide(df, _tickers_used, _all_start, _all_end, price_field)
+        except ValueError as e:
+            st.error(f"**Error building price matrix:** {e}")
+            st.stop()
+
+        _target_weights = {row["Ticker"]: row["Weight"] for _, row in _holdings.iterrows()}
+        _tolerances = {tk: default_tolerance_pct / 100.0 for tk in _tickers_used}
+        for _tk in _tickers_used:
+            _tol_key = f"tol_sidebar_{_tk}"
+            if _tol_key in st.session_state:
+                _tolerances[_tk] = float(st.session_state[_tol_key]) / 100.0
+
+        _strategy_results: Dict = {}
+        _event_logs: Dict = {}
+        _drift_histories: Dict = {}
+
+        if enable_calendar_rebal:
+            _freqs_to_run = REBAL_FREQS if show_all_strategies else [selected_freq]
+            for _freq in _freqs_to_run:
+                try:
+                    _rd, _rs = build_rebalanced_series(_prices_wide, _target_weights, float(initial_capital), _freq)
+                    _strategy_results[f"Rebal: {_freq}"] = (_rd, _rs)
+                except ValueError as e:
+                    st.warning(f"\u26a0\ufe0f Could not compute {_freq} rebalancing: {e}")
+        else:
+            _freqs_to_run = []
+
+        if enable_threshold_rebal:
+            try:
+                _thresh_rd, _thresh_rs, _thresh_log, _thresh_drift = build_threshold_rebalanced_series(
+                    prices_wide=_prices_wide, target_weights=_target_weights,
+                    initial_capital=float(initial_capital), tolerances=_tolerances,
+                    drift_mode=drift_mode, rebalance_action=rebalance_action,
+                    cooldown_days=cooldown_days,
+                    calendar_freq=selected_freq if enable_calendar_rebal else None,
+                    enable_calendar=enable_calendar_rebal, enable_threshold=True,
+                    whole_shares=allow_cash,
+                )
+                _combo_label = "Threshold" if not enable_calendar_rebal else f"Cal({selected_freq})+Thresh"
+                _strategy_results[_combo_label] = (_thresh_rd, _thresh_rs)
+                _event_logs[_combo_label] = _thresh_log
+                _drift_histories[_combo_label] = _thresh_drift
+            except ValueError as e:
+                st.warning(f"\u26a0\ufe0f Could not compute threshold rebalancing: {e}")
+
+        if _strategy_results:
+            _comparison_df = pd.DataFrame(index=_prices_wide.index)
+            _comparison_df.index.name = "PRICEDATE"
+            _comparison_df["Buy & Hold"] = _daily["Portfolio Value"].reindex(_comparison_df.index)
+            for _lbl, (_rd2, _rs2) in _strategy_results.items():
+                _comparison_df[_lbl] = _rd2["Portfolio Value"].reindex(_comparison_df.index)
+            _comparison_df = _comparison_df.dropna()
+
+            _bh_vals_arr = _comparison_df["Buy & Hold"].values
+            _bh_m2 = compute_strategy_metrics(_bh_vals_arr, float(initial_capital), benchmark_values=None)
+            _bh_m2.update({"rebalance_count": 0, "turnover_proxy": 0.0})
+
+            _metrics_raw: Dict = {
+                "Buy & Hold": {**_bh_m2, "turnover_dollars": 0.0, "est_transaction_cost": 0.0}
+            }
+            _metrics_rows = [{
+                "Strategy": "Buy & Hold",
+                "Final Value ($)": f"${_bh_vals_arr[-1]:,.0f}",
+                "Total Return": f"{_bh_m2['total_return']:+.2%}",
+                "CAGR": f"{_bh_m2['cagr']:+.2%}",
+                "Ann. Vol": f"{_bh_m2['annualized_vol']:.2%}",
+                "Sharpe": f"{_bh_m2['sharpe']:.3f}",
+                "Max DD": f"{_bh_m2['max_drawdown']:.2%}",
+                "Avg DD": f"{_bh_m2['avg_drawdown']:.2%}",
+                "Skew": f"{_bh_m2['skewness']:.3f}",
+                "Kurt": f"{_bh_m2['kurtosis']:.3f}",
+                "TE": "—", "IR": "—",
+                "Turnover": "0.00×", "Rebal Events": 0,
+                "Turnover ($)": "$0", "Est. Cost ($)": "$0",
+            }]
+
+            for _lbl in _strategy_results:
+                _rd3, _rs3 = _strategy_results[_lbl]
+                _vals3 = _comparison_df[_lbl].values
+                _m3 = compute_strategy_metrics(_vals3, float(initial_capital), benchmark_values=_bh_vals_arr)
+                _td3 = _rs3.get("total_turnover_dollars", 0.0)
+                _ec3 = _td3 * _total_cost_rate
+                _metrics_raw[_lbl] = {
+                    **_m3,
+                    "rebalance_count": _rs3["rebalance_count"],
+                    "turnover_proxy": _rs3["turnover_proxy"],
+                    "turnover_dollars": _td3,
+                    "est_transaction_cost": _ec3,
+                }
+                _metrics_rows.append({
+                    "Strategy": _lbl,
+                    "Final Value ($)": f"${_rs3['final_value']:,.0f}",
+                    "Total Return": f"{_m3['total_return']:+.2%}",
+                    "CAGR": f"{_m3['cagr']:+.2%}",
+                    "Ann. Vol": f"{_m3['annualized_vol']:.2%}",
+                    "Sharpe": f"{_m3['sharpe']:.3f}",
+                    "Max DD": f"{_m3['max_drawdown']:.2%}",
+                    "Avg DD": f"{_m3['avg_drawdown']:.2%}",
+                    "Skew": f"{_m3['skewness']:.3f}",
+                    "Kurt": f"{_m3['kurtosis']:.3f}",
+                    "TE": f"{_m3['tracking_error']:.4f}",
+                    "IR": f"{_m3['information_ratio']:.3f}",
+                    "Turnover": f"{_rs3['turnover_proxy']:.2f}×",
+                    "Rebal Events": _rs3["rebalance_count"],
+                    "Turnover ($)": f"${_td3:,.0f}",
+                    "Est. Cost ($)": f"${_ec3:,.0f}",
+                })
+            _metrics_df = pd.DataFrame(_metrics_rows)
+
+            # Strategy ranking
+            _rank_labels = list(_metrics_raw.keys())
+            _rank_dims = {
+                "CAGR (↑)": ("cagr", True), "Sharpe (↑)": ("sharpe", True),
+                "Max DD (↓)": ("max_drawdown", False), "IR vs B&H (↑)": ("information_ratio", True),
+                "Turnover (↓)": ("turnover_proxy", False), "Est. Cost $ (↓)": ("est_transaction_cost", False),
+            }
+            _rank_data: Dict = {lbl: {} for lbl in _rank_labels}
+            for _dim_name, (_dim_key, _hib) in _rank_dims.items():
+                _vfd = [(lbl, _metrics_raw[lbl].get(_dim_key, 0.0)) for lbl in _rank_labels]
+                _vfd.sort(key=lambda x: x[1], reverse=_hib)
+                for _rank, (lbl, _) in enumerate(_vfd, 1):
+                    _rank_data[lbl][_dim_name] = _rank
+            for lbl in _rank_labels:
+                _rank_data[lbl]["Composite Score"] = sum(_rank_data[lbl].values())
+            _rank_rows = []
+            for lbl in sorted(_rank_labels, key=lambda x: _rank_data[x]["Composite Score"]):
+                _rank_rows.append({"Strategy": lbl, **_rank_data[lbl]})
+            _rank_df = pd.DataFrame(_rank_rows)
+
+            # Cost breakdown
+            _cost_rows = []
+            for lbl in _rank_labels:
+                _mr = _metrics_raw[lbl]
+                _cost_rows.append({
+                    "Strategy": lbl,
+                    "Rebal Events": int(_mr["rebalance_count"]),
+                    "Turnover ($)": f"${_mr['turnover_dollars']:,.0f}",
+                    "Turnover Ratio": f"{_mr['turnover_proxy']:.2f}×",
+                    "Est. Commission ($)": f"${_mr['turnover_dollars'] * _commission_bps / 10000:,.0f}",
+                    "Est. Slippage ($)": f"${_mr['turnover_dollars'] * _slippage_bps / 10000:,.0f}",
+                    "Est. Bid-Ask ($)": f"${_mr['turnover_dollars'] * _bid_ask_bps / 10000:,.0f}",
+                    "Total Est. Cost ($)": f"${_mr['est_transaction_cost']:,.0f}",
+                    "Cost as % of Capital": f"{_mr['est_transaction_cost'] / float(initial_capital):.3%}",
+                })
+            _cost_df = pd.DataFrame(_cost_rows)
+
+            # Drawdown summary
+            _dd_rows = []
+            for _col in _comparison_df.columns:
+                _vals_dd = _comparison_df[_col].values
+                _dates_dd = _comparison_df.index
+                _rm_dd = np.maximum.accumulate(_vals_dd)
+                _dd = (_vals_dd - _rm_dd) / _rm_dd
+                _max_dd_idx = int(np.argmin(_dd))
+                _peak_idx = int(np.argmax(_vals_dd[:_max_dd_idx + 1]))
+                _peak_val = _vals_dd[_peak_idx]
+                _recovery_idx = None
+                for j in range(_max_dd_idx, len(_vals_dd)):
+                    if _vals_dd[j] >= _peak_val:
+                        _recovery_idx = j
+                        break
+                _dd_duration = _max_dd_idx - _peak_idx
+                _recovery_duration = (_recovery_idx - _max_dd_idx) if _recovery_idx is not None else None
+                _dd_rows.append({
+                    "Strategy": _col,
+                    "Max Drawdown": f"{_dd[_max_dd_idx]:.2%}",
+                    "Avg Drawdown": f"{np.mean(_dd):.2%}",
+                    "Peak Date": _dates_dd[_peak_idx].strftime("%Y-%m-%d"),
+                    "Trough Date": _dates_dd[_max_dd_idx].strftime("%Y-%m-%d"),
+                    "Recovery Date": _dates_dd[_recovery_idx].strftime("%Y-%m-%d") if _recovery_idx is not None else "Not recovered",
+                    "Days to Trough": _dd_duration,
+                    "Days to Recover": _recovery_duration if _recovery_duration is not None else "—",
+                })
+            _dd_df = pd.DataFrame(_dd_rows)
+
+            # Color map
+            _freq_color_map_c = {"Daily": "#e8710a", "Weekly": "#34a853", "Monthly": "#9c27b0", "Quarterly": "#ea4335"}
+            _all_strat_labels = list(_comparison_df.columns)
+            _color_map: Dict = {"Buy & Hold": "#1a73e8"}
+            for lbl in _strategy_results:
+                if lbl.startswith("Rebal:"):
+                    _color_map[lbl] = _freq_color_map_c.get(lbl.replace("Rebal: ", ""), "#666666")
+                else:
+                    _color_map[lbl] = "#ffab00"
+
+            _primary_label = list(_strategy_results.keys())[0]
+            _, _primary_stats = _strategy_results[_primary_label]
+
+            # Event log summary
+            _elog_summary_rows: list = []
+            _elog_sheets: Dict = {}
+            for lbl, _log_df in _event_logs.items():
+                if not _log_df.empty and "turnover_dollars" in _log_df.columns:
+                    _tot_to = _log_df["turnover_dollars"].sum()
+                    _avg_to = _log_df["turnover_dollars"].mean()
+                    _elog_summary_rows.append({
+                        "Strategy": lbl, "Total Events": len(_log_df),
+                        "Total Turnover ($)": f"${_tot_to:,.0f}",
+                        "Avg Turnover/Event ($)": f"${_avg_to:,.0f}",
+                        "Threshold Events": int((_log_df["reason"] == "threshold").sum()) if "reason" in _log_df.columns else "—",
+                        "Calendar Events": int((_log_df["reason"] == "calendar").sum()) if "reason" in _log_df.columns else "—",
+                    })
+                else:
+                    _elog_summary_rows.append({
+                        "Strategy": lbl, "Total Events": 0,
+                        "Total Turnover ($)": "$0", "Avg Turnover/Event ($)": "$0",
+                        "Threshold Events": 0, "Calendar Events": 0,
+                    })
+                _elog_sheets[lbl[:28]] = _log_df
+            _elog_sum_df = pd.DataFrame(_elog_summary_rows) if _elog_summary_rows else pd.DataFrame()
+
+            _rebal = {
+                "enabled": True, "has_strategies": True,
+                "prices_wide": _prices_wide, "tolerances": _tolerances,
+                "drift_mode": drift_mode,
+                "strategy_results": _strategy_results,
+                "event_logs": _event_logs, "drift_histories": _drift_histories,
+                "comparison_df": _comparison_df,
+                "bh_vals_arr": _bh_vals_arr, "bh_m2": _bh_m2,
+                "metrics_raw": _metrics_raw, "metrics_df": _metrics_df,
+                "rank_df": _rank_df, "cost_df": _cost_df, "dd_df": _dd_df,
+                "color_map": _color_map, "all_strat_labels": _all_strat_labels,
+                "primary_label": _primary_label, "primary_stats": _primary_stats,
+                "elog_sum_df": _elog_sum_df, "elog_sheets": _elog_sheets,
+                "enable_calendar_rebal": enable_calendar_rebal,
+                "enable_threshold_rebal": enable_threshold_rebal,
+                "selected_freq": selected_freq,
+            }
+        else:
+            _rebal = {"enabled": True, "has_strategies": False}
+
+    # ── Optimizer ─────────────────────────────────────────────────────────
+    _opt: Dict = {}
+    if enable_optimizer:
+        _div_df_opt = None
+        try:
+            import os as _os
+            _div_path = _os.path.join(_os.path.dirname(__file__), "dividend_data.csv")
+            if _os.path.exists(_div_path):
+                _div_df_opt = pd.read_csv(_div_path)
+                _div_df_opt["PAYDATE"] = pd.to_datetime(_div_df_opt["PAYDATE"], errors="coerce")
+                _div_df_opt["EXDATE"] = pd.to_datetime(_div_df_opt["EXDATE"], errors="coerce")
+                if "TICKERSYMBOL" not in _div_df_opt.columns:
+                    if "TRADINGITEMID" in _div_df_opt.columns and "TRADINGITEMID" in df.columns:
+                        _tkmap = (
+                            df[["TRADINGITEMID", "TICKERSYMBOL"]].drop_duplicates()
+                            .set_index("TRADINGITEMID")["TICKERSYMBOL"].to_dict()
+                        )
+                        _div_df_opt["TICKERSYMBOL"] = _div_df_opt["TRADINGITEMID"].map(_tkmap)
+                        _div_df_opt = _div_df_opt.dropna(subset=["TICKERSYMBOL"])
+        except Exception:
+            _div_df_opt = None
+
+        _opt_tax_rates = global_tax_rates
+        _opt_reinvest = opt_div_handling == "Reinvest dividends"
+        _opt_tickers_list = _holdings["Ticker"].tolist()
+        _opt_weights_list = _holdings["Weight"].tolist()
+        _opt_rebal_freq = selected_freq if enable_calendar_rebal else "None"
+
+        _static_result = None
+        _opt_result_full = None
+
+        with st.spinner("Running MSBA v1 Static simulation..."):
+            try:
+                _static_result = run_optimizer_simulation(
+                    prices_df=df, dividends_df=_div_df_opt,
+                    tickers=_opt_tickers_list, weights=_opt_weights_list,
+                    start_date=str(start_date), end_date=str(end_date),
+                    rebalance_frequency=_opt_rebal_freq,
+                    tax_rates=_opt_tax_rates, tlh_threshold=opt_tlh_threshold,
+                    reinvest_dividends=_opt_reinvest,
+                    initial_capital=float(initial_capital),
+                    price_field=price_field, static=True, cost_config=_cost_config,
+                )
+            except Exception as e:
+                st.error(f"MSBA v1 Static simulation failed: {e}")
+
+        with st.spinner("Running MSBA v1 Optimized simulation..."):
+            try:
+                _opt_result_full = run_optimizer_simulation(
+                    prices_df=df, dividends_df=_div_df_opt,
+                    tickers=_opt_tickers_list, weights=_opt_weights_list,
+                    start_date=str(start_date), end_date=str(end_date),
+                    rebalance_frequency=_opt_rebal_freq,
+                    tax_rates=_opt_tax_rates, tlh_threshold=opt_tlh_threshold,
+                    reinvest_dividends=_opt_reinvest,
+                    initial_capital=float(initial_capital),
+                    price_field=price_field, static=False, cost_config=_cost_config,
+                )
+            except Exception as e:
+                st.error(f"MSBA v1 Optimized simulation failed: {e}")
+
+        if _static_result and _opt_result_full:
+            _tlh_rows_opt = []
+            for _lbl_o, _res_o in [("Static (TLH only)", _static_result), ("Optimized (Rebal+TLH)", _opt_result_full)]:
+                _rdf_tmp = _res_o.get("realized_df", pd.DataFrame())
+                _losses_h = _res_o.get("losses_harvested", 0.0)
+                _tlh_ev = 0
+                if not _rdf_tmp.empty and "gain_loss" in _rdf_tmp.columns:
+                    _tlh_ev = int((_rdf_tmp["gain_loss"] < 0).sum())
+                _tax_saved_o = _losses_h * _opt_tax_rates.get("st_rate", 0.35)
+                _tx_cost_o = _res_o.get("transaction_costs_total", 0.0)
+                _net_ben = _tax_saved_o - _tx_cost_o - _res_o.get("tax_paid_total", 0.0)
+                _tlh_rows_opt.append({
+                    "Scenario": _lbl_o,
+                    "TLH Events (loss lots)": _tlh_ev,
+                    "Total Losses Harvested ($)": f"${_losses_h:,.0f}",
+                    "Est. Tax Savings ($)": f"${_tax_saved_o:,.0f}",
+                    "Tax Paid ($)": f"${_res_o.get('tax_paid_total', 0.0):,.0f}",
+                    "Exec Costs ($)": f"${_tx_cost_o:,.0f}",
+                    "Net Benefit ($)": f"${_net_ben:+,.0f}",
+                    "Final NAV ($)": f"${_res_o['nav_series'].iloc[-1]:,.0f}",
+                })
+            _tlh_df_opt = pd.DataFrame(_tlh_rows_opt)
+            _opt = {
+                "static_result": _static_result,
+                "opt_result": _opt_result_full,
+                "tlh_df": _tlh_df_opt,
+                "tax_rates": _opt_tax_rates,
+            }
+
+    # ── Holdings display formatting ────────────────────────────────────────
+    _display_df = _holdings.copy()
+    _display_df["Weight"] = _display_df["Weight"].apply(lambda x: f"{x:.1%}")
+    _display_df["Return"] = _display_df["Return"].apply(lambda x: f"{x:+.2%}")
+    _display_df["Gain (%)"] = _display_df["Gain (%)"].apply(lambda x: f"{x:+.2%}")
+    _display_df["Gain ($)"] = _display_df["Gain ($)"].apply(lambda x: f"${x:+,.2f}")
+    _display_df["Start Value"] = _display_df["Start Value"].apply(lambda x: f"${x:,.2f}")
+    _display_df["End Value"] = _display_df["End Value"].apply(lambda x: f"${x:,.2f}")
+    _display_df["Start Price"] = _display_df["Start Price"].apply(lambda x: f"${x:.2f}")
+    _display_df["End Price"] = _display_df["End Price"].apply(lambda x: f"${x:.2f}")
+
+    # ── Build export tables dict for Download All ──────────────────────────
+    _export: Dict[str, pd.DataFrame] = {
+        "Portfolio Summary": _summary_df,
+        "Allocation Drift": _drift_df,
+        "Holdings Detail": _holdings,
+    }
+    if _rebal.get("has_strategies"):
+        _export["Strategy Metrics"] = _rebal["metrics_df"]
+        _export["Strategy Ranking"] = _rebal["rank_df"]
+        _export["Transaction Costs"] = _rebal["cost_df"]
+        _export["Drawdown Summary"] = _rebal["dd_df"]
+        if not _rebal["elog_sum_df"].empty:
+            _export["Rebal Event Summary"] = _rebal["elog_sum_df"]
+    if _opt.get("opt_result"):
+        _export["TLH Tax Summary"] = _opt["tlh_df"]
+        _rdf_exp = _opt["opt_result"].get("realized_df", pd.DataFrame())
+        _tdf_exp = _opt["opt_result"].get("trades_df", pd.DataFrame())
+        if not _rdf_exp.empty:
+            _export["Realized Gains"] = _rdf_exp
+        if not _tdf_exp.empty:
+            _export["Trade Log"] = _tdf_exp
+
+    # ── Persist to session_state ───────────────────────────────────────────
+    st.session_state["_r"] = {
+        "summary": _summary, "holdings": _holdings, "display_df": _display_df,
+        "daily": _daily, "tickers_used": _tickers_used,
+        "bh_vals": _bh_vals, "bh_metrics": _bh_metrics, "n_days": _n_days,
+        "summary_df": _summary_df, "drift_df": _drift_df,
+        "rebal": _rebal, "opt": _opt, "export": _export,
+        "params": {
+            "start_date": str(start_date), "end_date": str(end_date),
+            "initial_capital": float(initial_capital),
+            "global_st_rate": global_st_rate, "global_lt_rate": global_lt_rate,
+            "global_tax_rates": global_tax_rates,
+            "commission_bps": _commission_bps, "slippage_bps": _slippage_bps,
+            "bid_ask_bps": _bid_ask_bps, "total_cost_rate": _total_cost_rate,
+            "run_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+# ----------------------------------------------------------------
+#  GUARD — show placeholder until first run
+# ----------------------------------------------------------------
+if "_r" not in st.session_state:
     st.info("\U0001f448 Configure your portfolio in the sidebar and press **Calculate Returns**.")
     st.stop()
 
-weight_sum = sum(weight_inputs)
-if weight_sum == 0:
-    st.error("All weights are zero. Please assign weights to at least one ticker.")
-    st.stop()
+# ----------------------------------------------------------------
+#  UNPACK from session_state
+# ----------------------------------------------------------------
+_r = st.session_state["_r"]
+summary = _r["summary"]
+holdings = _r["holdings"]
+display_df = _r["display_df"]
+daily = _r["daily"]
+tickers_used = _r["tickers_used"]
+_bh_vals = _r["bh_vals"]
+_bh_metrics = _r["bh_metrics"]
+_n_days = _r["n_days"]
+_summary_df = _r["summary_df"]
+_drift_df = _r["drift_df"]
+rebal = _r["rebal"]
+opt = _r["opt"]
+export = _r["export"]
+p = _r["params"]
 
-# Run the core buy-and-hold engine — this produces the holdings table and
-# summary stats that all downstream sections (charts, rebalancing, optimizer) use.
-try:
-    summary, holdings = calculate_portfolio_returns(
-        df=df, tickers=ticker_inputs, weights=weight_inputs,
-        start_date=str(start_date), end_date=str(end_date),
-        initial_capital=float(initial_capital), price_field=price_field,
-        allow_cash_residual=allow_cash,
-    )
-except ValueError as e:
-    st.error(f"**Error:** {e}")
-    st.stop()
+# Timestamp badge so users know when results were last computed
+st.caption(
+    f"\U0001f4ca Results from **{p.get('run_timestamp', 'last run')}**. "
+    "Press **Calculate Returns** in the sidebar to recompute with current settings."
+)
 
+# ── Dropped ticker warnings ────────────────────────────────────────────────
 if summary["tickers_dropped"] > 0:
     for tk, w, reason in summary["dropped_details"]:
         st.warning(f"\u26a0\ufe0f Dropped **{tk}** (weight {w:.2%}): {reason}")
 
-# KPI Cards (Buy-and-Hold)
+# ── KPI Cards (Buy-and-Hold) ───────────────────────────────────────────────
 total_return = summary["portfolio_total_return"]
 gain_dollars = summary["total_unrealized_gain_dollars"]
 
@@ -1361,42 +1828,16 @@ col4.metric("Unrealized Gain", f"${gain_dollars:+,.0f}", delta=f"{summary['total
 
 st.markdown("---")
 
-# Build the buy-and-hold daily time series (used for charts and as benchmark)
-daily = build_daily_series(df, holdings, float(initial_capital), price_field)
-tickers_used = holdings["Ticker"].tolist()
-
 st.subheader("Portfolio Value vs Cost Basis")
-chart1_df = daily[["Portfolio Value", "Cost Basis"]].copy()
-st.line_chart(chart1_df, color=["#1a73e8", "#888888"], use_container_width=True, height=380)
+st.line_chart(_safe_chart_cols(daily[["Portfolio Value", "Cost Basis"]]), color=["#1a73e8", "#888888"], use_container_width=True, height=380)
 
 st.subheader("Per-Ticker Cumulative Return (%)")
-return_cols = [f"{tk} Return (%)" for tk in tickers_used]
+return_cols = [f"{tk} Return (%)" for tk in tickers_used if f"{tk} Return (%)" in daily.columns]
 st.line_chart(_safe_chart_cols(daily[return_cols]), use_container_width=True, height=320)
 
 # ── Portfolio Summary Statistics Table ─────────────────────────────────────
 st.markdown("---")
 st.subheader("Portfolio Summary Statistics")
-_bh_vals = daily["Portfolio Value"].values
-_bh_metrics = compute_strategy_metrics(_bh_vals, float(initial_capital))
-_n_days = len(_bh_vals)
-_years = _n_days / 252.0
-
-_summary_rows = [
-    ("Period", f"{str(start_date)} → {str(end_date)}"),
-    ("Trading Days", f"{_n_days:,}"),
-    ("Initial Capital", f"${float(initial_capital):,.0f}"),
-    ("Final Value (B&H)", f"${_bh_vals[-1]:,.0f}"),
-    ("Total Return", f"{_bh_metrics['total_return']:+.2%}"),
-    ("CAGR", f"{_bh_metrics['cagr']:+.2%}"),
-    ("Annualized Volatility", f"{_bh_metrics['annualized_vol']:.2%}"),
-    ("Sharpe Ratio (Rf=0)", f"{_bh_metrics['sharpe']:.3f}"),
-    ("Max Drawdown", f"{_bh_metrics['max_drawdown']:.2%}"),
-    ("Avg Drawdown", f"{_bh_metrics['avg_drawdown']:.2%}"),
-    ("Calmar Ratio", f"{abs(_bh_metrics['cagr'] / _bh_metrics['max_drawdown']):.3f}" if _bh_metrics['max_drawdown'] != 0 else "—"),
-    ("Return Skewness", f"{_bh_metrics['skewness']:.3f}"),
-    ("Excess Kurtosis", f"{_bh_metrics['kurtosis']:.3f}"),
-]
-_summary_df = pd.DataFrame(_summary_rows, columns=["Metric", "Value (Buy & Hold)"])
 _s_col1, _s_col2 = st.columns([2, 1])
 with _s_col1:
     st.dataframe(_summary_df, use_container_width=True, hide_index=True)
@@ -1406,25 +1847,6 @@ with _s_col2:
         label="Portfolio Summary Stats", sheet_name="Summary Stats",
     )
 
-# ── Allocation Drift Table (current weights vs target) ─────────────────────
-_final_values = {row["Ticker"]: row["End Value"] for _, row in holdings.iterrows()}
-_port_end_val = sum(_final_values.values())
-_drift_rows = []
-for _, row in holdings.iterrows():
-    tk = row["Ticker"]
-    target_w = row["Weight"]
-    end_val = row["End Value"]
-    actual_w = end_val / _port_end_val if _port_end_val > 0 else 0.0
-    drift_abs = actual_w - target_w
-    _drift_rows.append({
-        "Ticker": tk,
-        "Target Weight": f"{target_w:.1%}",
-        "Actual Weight (End)": f"{actual_w:.1%}",
-        "Drift (pp)": f"{drift_abs:+.2%}",
-        "Drift Direction": "Overweight" if drift_abs > 0.005 else ("Underweight" if drift_abs < -0.005 else "On Target"),
-        "End Value ($)": f"${end_val:,.0f}",
-    })
-_drift_df = pd.DataFrame(_drift_rows)
 st.markdown("#### Allocation Drift (End of Period)")
 st.caption("Difference between target weights and actual weights at end of period.")
 _d_col1, _d_col2 = st.columns([3, 1])
@@ -1440,177 +1862,38 @@ st.markdown("---")
 
 
 # ================================================================
-# REBALANCING COMPARISON SECTION (Calendar + Threshold)
+# REBALANCING COMPARISON SECTION (read from session_state)
 # ================================================================
-# This section orchestrates all rebalancing strategies and presents them
-# in a unified comparison view. The wide price matrix is built once and
-# shared across all strategy computations.
 
-if enable_rebalancing:
+if rebal["enabled"]:
     st.subheader("\U0001f504 Rebalancing Strategy Comparison")
-    target_weights = {row["Ticker"]: row["Weight"] for _, row in holdings.iterrows()}
-
-    try:
-        all_start = pd.to_datetime(holdings["Start Date"]).min()
-        all_end = pd.to_datetime(holdings["End Date"]).max()
-        prices_wide = build_prices_wide(df, tickers_used, all_start, all_end, price_field)
-    except ValueError as e:
-        st.error(f"**Error building price matrix:** {e}")
-        st.stop()
-
-    ### Per-asset tolerance UI — allows overriding the global default tolerance
-    ### for individual tickers (e.g., tighter band on a volatile small-cap)
-    tolerances = {tk: default_tolerance_pct / 100.0 for tk in tickers_used}
-    if enable_threshold_rebal:
-        with st.expander("\U0001f4cf Advanced: Per-Asset Drift Tolerances"):
-            st.caption("Override the default tolerance for individual tickers.")
-            tol_cols = st.columns(min(len(tickers_used), 4))
-            for idx, tk in enumerate(tickers_used):
-                col_idx = idx % min(len(tickers_used), 4)
-                tol_val = tol_cols[col_idx].number_input(
-                    f"{tk} tol (%)", min_value=0.5, max_value=50.0,
-                    value=default_tolerance_pct, step=0.5,
-                    key=f"tol_{tk}", format="%.1f",
-                )
-                tolerances[tk] = tol_val / 100.0
-
-    # Compute all enabled strategies
-    strategy_results = {}
-    event_logs = {}
-    drift_histories = {}
-
-    # Calendar strategies (V3 engine — one run per frequency)
-    if enable_calendar_rebal:
-        if show_all_strategies:
-            freqs_to_run = REBAL_FREQS
-            st.caption("Computing: Buy & Hold + all calendar frequencies" +
-                       (" + Threshold" if enable_threshold_rebal else "") + "...")
-        else:
-            freqs_to_run = [selected_freq]
-            st.caption(f"Comparing Buy & Hold vs **{selected_freq}** rebalancing" +
-                       (" + Threshold" if enable_threshold_rebal else "") + ".")
-        for freq in freqs_to_run:
-            try:
-                rd, rs = build_rebalanced_series(prices_wide, target_weights, float(initial_capital), freq)
-                strategy_results[f"Rebal: {freq}"] = (rd, rs)
-            except ValueError as e:
-                st.warning(f"\u26a0\ufe0f Could not compute {freq} rebalancing: {e}")
-    else:
-        freqs_to_run = []
-        if enable_threshold_rebal:
-            st.caption("Comparing Buy & Hold vs **Threshold** rebalancing (no calendar).")
-
-    # Threshold strategy (V4 engine — may include calendar combo)
-    if enable_threshold_rebal:
-        try:
-            thresh_rd, thresh_rs, thresh_log, thresh_drift = build_threshold_rebalanced_series(
-                prices_wide=prices_wide, target_weights=target_weights,
-                initial_capital=float(initial_capital), tolerances=tolerances,
-                drift_mode=drift_mode, rebalance_action=rebalance_action,
-                cooldown_days=cooldown_days,
-                calendar_freq=selected_freq if enable_calendar_rebal else None,
-                enable_calendar=enable_calendar_rebal, enable_threshold=True,
-                whole_shares=allow_cash,
-            )
-            # Label reflects whether this is threshold-only or a calendar+threshold combo
-            combo_label = "Threshold" if not enable_calendar_rebal else f"Cal({selected_freq})+Thresh"
-            strategy_results[combo_label] = (thresh_rd, thresh_rs)
-            event_logs[combo_label] = thresh_log
-            drift_histories[combo_label] = thresh_drift
-        except ValueError as e:
-            st.warning(f"\u26a0\ufe0f Could not compute threshold rebalancing: {e}")
-
-    if not strategy_results and not enable_threshold_rebal and not enable_calendar_rebal:
+    if not rebal.get("has_strategies", False):
         st.info("Enable at least one rebalancing strategy to see comparison results.")
-    elif strategy_results:
-        # Align all strategy series to the same date index for apples-to-apples comparison.
-        # The reindex + dropna ensures we only compare days where ALL strategies have data.
-        # This handles edge cases where the buy-and-hold series has slightly different
-        # date coverage than the rebalanced series (due to the outer join in build_daily_series).
-        comparison_df = pd.DataFrame(index=prices_wide.index)
-        comparison_df.index.name = "PRICEDATE"
-        # Buy-and-hold comes from the daily series built earlier; reindex aligns it
-        # to the wide price matrix's trading days.
-        bh_values = daily["Portfolio Value"].reindex(comparison_df.index)
-        comparison_df["Buy & Hold"] = bh_values
-        for label, (rd, rs) in strategy_results.items():
-            comparison_df[label] = rd["Portfolio Value"].reindex(comparison_df.index)
-        comparison_df = comparison_df.dropna()
+    else:
 
-        # Enhanced metrics table: each strategy benchmarked against buy-and-hold.
-        # Buy-and-hold is computed with benchmark_values=None (no self-tracking-error)
-        # while all other strategies pass bh_vals_arr as benchmark for TE/IR calculation.
-        bh_vals_arr = comparison_df["Buy & Hold"].values
-        bh_metrics = compute_strategy_metrics(bh_vals_arr, float(initial_capital), benchmark_values=None)
-        # Manually inject rebalancing-specific fields that compute_strategy_metrics doesn't produce
-        bh_metrics["rebalance_count"] = 0
-        bh_metrics["turnover_proxy"] = 0.0
+        # ── Unpack rebalancing results from session_state ─────────────────
+        comparison_df = rebal["comparison_df"]
+        metrics_df = rebal["metrics_df"]
+        _rank_df = rebal["rank_df"]
+        _cost_df = rebal["cost_df"]
+        _dd_df = rebal["dd_df"]
+        _metrics_raw = rebal["metrics_raw"]
+        strategy_results = rebal["strategy_results"]
+        event_logs = rebal["event_logs"]
+        drift_histories = rebal["drift_histories"]
+        _color_map = rebal["color_map"]
+        _all_strat_labels = rebal["all_strat_labels"]
+        primary_label = rebal["primary_label"]
+        primary_stats = rebal["primary_stats"]
+        _elog_sum_df = rebal["elog_sum_df"]
+        _elog_sheets = rebal["elog_sheets"]
+        _commission_bps_d = p["commission_bps"]
+        _slippage_bps_d = p["slippage_bps"]
+        _bid_ask_bps_d = p["bid_ask_bps"]
+        _total_cost_rate_d = p["total_cost_rate"]
 
-        # Collect raw (numeric) metrics for ranking and cost estimation
-        metrics_raw = {}  # label → dict of raw floats
-
-        bh_turnover_dollars = 0.0
-        bh_est_cost = 0.0
-        metrics_raw["Buy & Hold"] = {
-            **bh_metrics,
-            "rebalance_count": 0, "turnover_proxy": 0.0,
-            "turnover_dollars": bh_turnover_dollars,
-            "est_transaction_cost": bh_est_cost,
-        }
-
-        metrics_rows = [{
-            "Strategy": "Buy & Hold",
-            "Final Value ($)": f"${bh_vals_arr[-1]:,.0f}",
-            "Total Return": f"{bh_metrics['total_return']:+.2%}",
-            "CAGR": f"{bh_metrics['cagr']:+.2%}",
-            "Ann. Vol": f"{bh_metrics['annualized_vol']:.2%}",
-            "Sharpe": f"{bh_metrics['sharpe']:.3f}",
-            "Max DD": f"{bh_metrics['max_drawdown']:.2%}",
-            "Avg DD": f"{bh_metrics['avg_drawdown']:.2%}",
-            "Skew": f"{bh_metrics['skewness']:.3f}",
-            "Kurt": f"{bh_metrics['kurtosis']:.3f}",
-            "TE": "—",
-            "IR": "—",
-            "Turnover": "0.00×",
-            "Rebal Events": 0,
-            "Turnover ($)": "$0",
-            "Est. Cost ($)": "$0",
-        }]
-
-        for label in strategy_results:
-            rd, rs = strategy_results[label]
-            vals = comparison_df[label].values
-            m = compute_strategy_metrics(vals, float(initial_capital), benchmark_values=bh_vals_arr)
-            turnover_dollars = rs.get("total_turnover_dollars", 0.0)
-            est_cost = turnover_dollars * _total_cost_rate
-            metrics_raw[label] = {
-                **m,
-                "rebalance_count": rs["rebalance_count"],
-                "turnover_proxy": rs["turnover_proxy"],
-                "turnover_dollars": turnover_dollars,
-                "est_transaction_cost": est_cost,
-            }
-            metrics_rows.append({
-                "Strategy": label,
-                "Final Value ($)": f"${rs['final_value']:,.0f}",
-                "Total Return": f"{m['total_return']:+.2%}",
-                "CAGR": f"{m['cagr']:+.2%}",
-                "Ann. Vol": f"{m['annualized_vol']:.2%}",
-                "Sharpe": f"{m['sharpe']:.3f}",
-                "Max DD": f"{m['max_drawdown']:.2%}",
-                "Avg DD": f"{m['avg_drawdown']:.2%}",
-                "Skew": f"{m['skewness']:.3f}",
-                "Kurt": f"{m['kurtosis']:.3f}",
-                "TE": f"{m['tracking_error']:.4f}",
-                "IR": f"{m['information_ratio']:.3f}",
-                "Turnover": f"{rs['turnover_proxy']:.2f}×",
-                "Rebal Events": rs["rebalance_count"],
-                "Turnover ($)": f"${turnover_dollars:,.0f}",
-                "Est. Cost ($)": f"${est_cost:,.0f}",
-            })
-
+        # ── Performance Metrics Table ──────────────────────────────────────
         st.markdown("#### Performance Metrics")
-        metrics_df = pd.DataFrame(metrics_rows)
         _mc1, _mc2 = st.columns([5, 1])
         with _mc1:
             st.dataframe(metrics_df, use_container_width=True, hide_index=True)
@@ -1620,39 +1903,13 @@ if enable_rebalancing:
                 label="Strategy Comparison", sheet_name="Metrics",
             )
         st.caption(
-            f"Est. Cost = Turnover ($) × {_total_cost_rate*10000:.0f} bps "
-            f"({_commission_bps:.0f} commission + {_slippage_bps:.0f} slippage + {_bid_ask_bps:.0f} bid-ask). "
+            f"Est. Cost = Turnover ($) × {_total_cost_rate_d*10000:.0f} bps "
+            f"({_commission_bps_d:.0f} commission + {_slippage_bps_d:.0f} slippage + {_bid_ask_bps_d:.0f} bid-ask). "
             "Sharpe uses Rf=0."
         )
 
-        # ── Strategy Ranking Table ──────────────────────────────────────────
-        # Composite scoring: each strategy ranked across 6 dimensions.
-        # Higher CAGR, higher Sharpe, higher IR = better → rank ascending (1=best).
-        # Lower Max DD, lower Turnover, lower Est. Cost = better → rank ascending.
-        # Equal weight per dimension. Ties broken by sum of raw ranks.
+        # ── Strategy Ranking ────────────────────────────────────────────────
         st.markdown("#### Strategy Ranking")
-        _rank_labels = list(metrics_raw.keys())
-        _rank_dims = {
-            "CAGR (↑)": ("cagr", True),
-            "Sharpe (↑)": ("sharpe", True),
-            "Max DD (↓)": ("max_drawdown", False),
-            "IR vs B&H (↑)": ("information_ratio", True),
-            "Turnover (↓)": ("turnover_proxy", False),
-            "Est. Cost $ (↓)": ("est_transaction_cost", False),
-        }
-        _rank_data: Dict[str, dict] = {lbl: {} for lbl in _rank_labels}
-        for dim_name, (key, higher_is_better) in _rank_dims.items():
-            vals_for_dim = [(lbl, metrics_raw[lbl].get(key, 0.0)) for lbl in _rank_labels]
-            vals_for_dim.sort(key=lambda x: x[1], reverse=higher_is_better)
-            for rank, (lbl, _) in enumerate(vals_for_dim, 1):
-                _rank_data[lbl][dim_name] = rank
-        for lbl in _rank_labels:
-            _rank_data[lbl]["Composite Score"] = sum(_rank_data[lbl].values())
-        _rank_rows = []
-        for lbl in sorted(_rank_labels, key=lambda x: _rank_data[x]["Composite Score"]):
-            row = {"Strategy": lbl, **_rank_data[lbl]}
-            _rank_rows.append(row)
-        _rank_df = pd.DataFrame(_rank_rows)
         _rk1, _rk2 = st.columns([4, 1])
         with _rk1:
             st.dataframe(_rank_df, use_container_width=True, hide_index=True)
@@ -1663,23 +1920,8 @@ if enable_rebalancing:
             )
         st.caption("Composite Score = sum of per-dimension ranks. **Lower score = better overall.** Ranks 1=best within each dimension.")
 
-        # ── Transaction Cost Breakdown Table ────────────────────────────────
+        # ── Transaction Cost Breakdown ───────────────────────────────────────
         st.markdown("#### Transaction Cost Breakdown")
-        _cost_rows = []
-        for lbl in _rank_labels:
-            mr = metrics_raw[lbl]
-            _cost_rows.append({
-                "Strategy": lbl,
-                "Rebal Events": int(mr["rebalance_count"]),
-                "Turnover ($)": f"${mr['turnover_dollars']:,.0f}",
-                "Turnover Ratio": f"{mr['turnover_proxy']:.2f}×",
-                "Est. Commission ($)": f"${mr['turnover_dollars'] * _commission_bps / 10000:,.0f}",
-                "Est. Slippage ($)": f"${mr['turnover_dollars'] * _slippage_bps / 10000:,.0f}",
-                "Est. Bid-Ask ($)": f"${mr['turnover_dollars'] * _bid_ask_bps / 10000:,.0f}",
-                "Total Est. Cost ($)": f"${mr['est_transaction_cost']:,.0f}",
-                "Cost as % of Capital": f"{mr['est_transaction_cost'] / float(initial_capital):.3%}",
-            })
-        _cost_df = pd.DataFrame(_cost_rows)
         _cc1, _cc2 = st.columns([4, 1])
         with _cc1:
             st.dataframe(_cost_df, use_container_width=True, hide_index=True)
@@ -1689,37 +1931,8 @@ if enable_rebalancing:
                 label="Transaction Costs", sheet_name="Costs",
             )
 
-        # ── Drawdown Summary Table ───────────────────────────────────────────
+        # ── Drawdown Summary ─────────────────────────────────────────────────
         st.markdown("#### Drawdown Summary")
-        _dd_rows = []
-        for col in comparison_df.columns:
-            vals = comparison_df[col].values
-            dates = comparison_df.index
-            rm = np.maximum.accumulate(vals)
-            dd = (vals - rm) / rm
-            max_dd_idx = int(np.argmin(dd))
-            # Find the peak before max drawdown
-            peak_idx = int(np.argmax(vals[:max_dd_idx + 1]))
-            # Recovery: first date after trough where value >= peak
-            peak_val = vals[peak_idx]
-            recovery_idx = None
-            for j in range(max_dd_idx, len(vals)):
-                if vals[j] >= peak_val:
-                    recovery_idx = j
-                    break
-            dd_duration = max_dd_idx - peak_idx
-            recovery_duration = (recovery_idx - max_dd_idx) if recovery_idx is not None else None
-            _dd_rows.append({
-                "Strategy": col,
-                "Max Drawdown": f"{dd[max_dd_idx]:.2%}",
-                "Avg Drawdown": f"{np.mean(dd):.2%}",
-                "Peak Date": dates[peak_idx].strftime("%Y-%m-%d"),
-                "Trough Date": dates[max_dd_idx].strftime("%Y-%m-%d"),
-                "Recovery Date": dates[recovery_idx].strftime("%Y-%m-%d") if recovery_idx is not None else "Not recovered",
-                "Days to Trough": dd_duration,
-                "Days to Recover": recovery_duration if recovery_duration is not None else "—",
-            })
-        _dd_df = pd.DataFrame(_dd_rows)
         _ddc1, _ddc2 = st.columns([5, 1])
         with _ddc1:
             st.dataframe(_dd_df, use_container_width=True, hide_index=True)
@@ -1729,50 +1942,25 @@ if enable_rebalancing:
                 label="Drawdown Summary", sheet_name="Drawdowns",
             )
 
-        # KPI cards: headline comparison of first strategy vs buy-and-hold.
-        primary_label = list(strategy_results.keys())[0]
-        _, primary_stats = strategy_results[primary_label]
-        bh_final = bh_vals_arr[-1]
-        rb_final = primary_stats["final_value"]
-        rb_return = primary_stats["total_return"]
-        bh_ret = bh_metrics["total_return"]
-
+        # ── KPI Cards ────────────────────────────────────────────────────────
+        _bh_final = rebal["bh_vals_arr"][-1]
+        _rb_final = primary_stats["final_value"]
+        _rb_return = primary_stats["total_return"]
+        _bh_ret = rebal["bh_m2"]["total_return"]
         rc1, rc2, rc3, rc4 = st.columns(4)
-        rc1.metric(f"{primary_label} Final", f"${rb_final:,.0f}", delta=f"{rb_return:+.2%}")
-        rc2.metric("Buy-and-Hold Final", f"${bh_final:,.0f}", delta=f"{bh_ret:+.2%}")
-        rc3.metric("Strategy Advantage", f"${rb_final - bh_final:+,.0f}", delta=f"{(rb_return - bh_ret):+.4%}")
+        rc1.metric(f"{primary_label} Final", f"${_rb_final:,.0f}", delta=f"{_rb_return:+.2%}")
+        rc2.metric("Buy-and-Hold Final", f"${_bh_final:,.0f}", delta=f"{_bh_ret:+.2%}")
+        rc3.metric("Strategy Advantage", f"${_rb_final - _bh_final:+,.0f}", delta=f"{(_rb_return - _bh_ret):+.4%}")
         rc4.metric("Rebalance Events", f"{primary_stats['rebalance_count']:,}", delta=f"Turnover: {primary_stats['turnover_proxy']:.2f}")
 
-        # Portfolio value chart with strategy toggle
+        # ── Portfolio Value Chart ────────────────────────────────────────────
         st.markdown("#### Portfolio Value Over Time")
-        # Color mapping: each strategy type gets a distinct color for visual clarity.
-        # Blue for B&H (the stable baseline), warm colors for calendar frequencies
-        # (orange/green/purple/red in order of increasing interval), and amber for
-        # threshold to distinguish it from all calendar strategies.
-        freq_color_map = {"Daily": "#e8710a", "Weekly": "#34a853", "Monthly": "#9c27b0", "Quarterly": "#ea4335"}
-        threshold_color = "#ffab00"
-
-        # Build a color map keyed by strategy label for consistent coloring.
-        # Strategy labels follow patterns: "Buy & Hold", "Rebal: Monthly", "Threshold",
-        # or "Cal(Monthly)+Thresh" — the prefix determines which color pool to use.
-        _all_strat_labels = list(comparison_df.columns)
-        _color_map = {}
-        _color_map["Buy & Hold"] = "#1a73e8"
-        for label in strategy_results:
-            if label.startswith("Rebal:"):
-                freq_key = label.replace("Rebal: ", "")
-                _color_map[label] = freq_color_map.get(freq_key, "#666666")
-            else:
-                _color_map[label] = threshold_color
-
-        # Multiselect lets users toggle individual strategies on/off in the chart
         selected_strats = st.multiselect(
             "Strategies to display",
             options=_all_strat_labels,
             default=_all_strat_labels,
             key="value_chart_strats",
         )
-
         if selected_strats:
             _chart_df = comparison_df[selected_strats]
             _chart_colors = [_color_map.get(s, "#666666") for s in selected_strats]
@@ -1782,54 +1970,39 @@ if enable_rebalancing:
 
         strategy_colors = [_color_map.get(c, "#666666") for c in comparison_df.columns]
 
-        # Drawdown chart: shows peak-to-trough declines over time for all strategies.
-        # Drawdown at day i = (value_i - max_value_up_to_i) / max_value_up_to_i × 100.
-        # Values are always ≤ 0 (0% = at peak, -10% = 10% below peak).
-        # Area chart makes periods of drawdown visually prominent.
         show_drawdown = st.checkbox("Show Drawdown Chart", value=False)
         if show_drawdown:
             st.markdown("#### Drawdown Over Time")
-            dd_df = pd.DataFrame(index=comparison_df.index)
-            for col in comparison_df.columns:
-                vals = comparison_df[col].values
-                # Running max = the highest portfolio value seen up to each point
-                rm = np.maximum.accumulate(vals)
-                dd_df[col] = ((vals - rm) / rm) * 100
-            st.area_chart(_safe_chart_cols(dd_df), color=strategy_colors, use_container_width=True, height=300)
+            dd_chart_df = pd.DataFrame(index=comparison_df.index)
+            for _col in comparison_df.columns:
+                _vals_c = comparison_df[_col].values
+                _rm_c = np.maximum.accumulate(_vals_c)
+                dd_chart_df[_col] = ((_vals_c - _rm_c) / _rm_c) * 100
+            st.area_chart(_safe_chart_cols(dd_chart_df), color=strategy_colors, use_container_width=True, height=300)
 
-        # Difference chart: visual of strategy advantage/disadvantage vs buy-and-hold
         if primary_label in comparison_df.columns:
             diff_series = comparison_df[primary_label] - comparison_df["Buy & Hold"]
             diff_chart = pd.DataFrame({f"{primary_label} vs B&H ($)": diff_series})
             advantage_color = "#34a853" if diff_series.iloc[-1] >= 0 else "#ea4335"
             st.area_chart(_safe_chart_cols(diff_chart), color=[advantage_color], use_container_width=True, height=200)
 
-        ### DRIFT DIAGNOSTICS ###
-        # Only shown when threshold rebalancing produced drift history data.
-        # Provides per-ticker drift distribution analysis to help users calibrate
-        # their tolerance bands — are they too tight (constant rebalancing) or
-        # too loose (drift never triggers)?
+        # ── Drift Diagnostics ────────────────────────────────────────────────
         if drift_histories:
             st.markdown("---")
             st.markdown("#### \U0001f4ca Drift Diagnostics")
             drift_strategy_options = list(drift_histories.keys())
 
-            # Persist dropdown selections across reruns via session_state so the
-            # UI doesn't reset every time Streamlit re-executes
             if "drift_strat_idx" not in st.session_state:
                 st.session_state["drift_strat_idx"] = 0
             if "drift_ticker_idx" not in st.session_state:
                 st.session_state["drift_ticker_idx"] = 0
 
-            # Clamp indices to valid range (strategies/tickers may change between runs)
             _strat_idx = min(st.session_state["drift_strat_idx"], len(drift_strategy_options) - 1)
             _ticker_idx = min(st.session_state["drift_ticker_idx"], len(tickers_used) - 1)
 
             selected_drift_strategy = st.selectbox(
                 "Select strategy for drift analysis",
-                drift_strategy_options,
-                index=_strat_idx,
-                key="drift_strat_select",
+                drift_strategy_options, index=_strat_idx, key="drift_strat_select",
             )
             st.session_state["drift_strat_idx"] = drift_strategy_options.index(selected_drift_strategy)
 
@@ -1837,80 +2010,48 @@ if enable_rebalancing:
 
             drift_ticker_select = st.selectbox(
                 "Select ticker for drift distribution",
-                tickers_used,
-                index=_ticker_idx,
-                key="drift_ticker_select",
+                tickers_used, index=_ticker_idx, key="drift_ticker_select",
             )
             st.session_state["drift_ticker_idx"] = tickers_used.index(drift_ticker_select)
 
             drift_values = np.array(dh[drift_ticker_select])
             if len(drift_values) > 0:
-                # Display drift stats as percentages for readability
                 drift_pct = drift_values * 100.0
-                tol_for_tk = tolerances.get(drift_ticker_select, default_tolerance_pct / 100.0)
-                # "Days Breached" tells users what % of trading days this ticker
-                # would have exceeded its tolerance — a key input for calibration
+                _drift_mode_lbl = rebal.get("drift_mode", "Absolute")
+                tol_for_tk = rebal["tolerances"].get(drift_ticker_select, 0.05)
                 breach_pct = np.mean(drift_values > tol_for_tk) * 100
 
                 ds1, ds2, ds3, ds4 = st.columns(4)
-                ds1.metric(f"Mean Drift ({drift_mode})", f"{np.mean(drift_pct):.2f}%")
+                ds1.metric(f"Mean Drift ({_drift_mode_lbl})", f"{np.mean(drift_pct):.2f}%")
                 ds2.metric("P95 Drift", f"{np.percentile(drift_pct, 95):.2f}%")
                 ds3.metric("Max Drift", f"{np.max(drift_pct):.2f}%")
                 ds4.metric("Days Breached (%)", f"{breach_pct:.1f}%")
 
-                # Histogram of daily drift values — bin count scales with data length
-                # to avoid either too few bins (hiding distribution shape with <1yr data)
-                # or too many (noisy with multi-year data). The 15-30 range works well
-                # for typical simulation lengths of 252-1260 trading days.
                 n_bins = min(30, max(15, len(drift_pct) // 15))
                 counts, bin_edges = np.histogram(drift_pct, bins=n_bins)
-                bin_labels = [
-                    f"{bin_edges[j]:.2f}-{bin_edges[j+1]:.2f}"
-                    for j in range(len(counts))
-                ]
-                hist_df = pd.DataFrame({
-                    "Drift_pct": bin_labels,
-                    "Days_count": counts,
-                }).set_index("Drift_pct")
+                bin_labels = [f"{bin_edges[j]:.2f}-{bin_edges[j+1]:.2f}" for j in range(len(counts))]
+                hist_df = pd.DataFrame({"Drift_pct": bin_labels, "Days_count": counts}).set_index("Drift_pct")
                 st.bar_chart(hist_df, use_container_width=True, height=250)
                 st.caption(
-                    f"Distribution of daily {drift_mode.lower()} drift (%) for **{drift_ticker_select}** "
+                    f"Distribution of daily {_drift_mode_lbl.lower()} drift (%) for **{drift_ticker_select}** "
                     f"under **{selected_drift_strategy}**. Tolerance = {tol_for_tk:.2%}."
                 )
 
-            # Optional time series view — shows drift evolution over the full period
             show_drift_ts = st.checkbox("Show drift time series (all tickers)", value=False)
             if show_drift_ts:
+                prices_wide_d = rebal["prices_wide"]
                 drift_ts_data = {tk: np.array(vals) * 100.0 for tk, vals in dh.items()}
-                drift_ts_df = pd.DataFrame(drift_ts_data, index=prices_wide.index[:len(list(dh.values())[0])])
+                drift_ts_df = pd.DataFrame(
+                    drift_ts_data,
+                    index=prices_wide_d.index[:len(list(dh.values())[0])],
+                )
                 drift_ts_df.index.name = "PRICEDATE"
                 st.line_chart(drift_ts_df, use_container_width=True, height=300)
-                st.caption(f"Daily {drift_mode.lower()} drift (%) per ticker under **{selected_drift_strategy}**.")
+                st.caption(f"Daily drift (%) per ticker under **{selected_drift_strategy}**.")
 
-        ### EVENT LOG — structured record of every rebalance event ###
+        # ── Event Log ────────────────────────────────────────────────────────
         if event_logs:
-            # Summary table: aggregate statistics per strategy
-            _elog_summary = []
-            _elog_sheets = {}
-            for label, log_df in event_logs.items():
-                if not log_df.empty and "turnover_dollars" in log_df.columns:
-                    total_to = log_df["turnover_dollars"].sum()
-                    avg_to = log_df["turnover_dollars"].mean()
-                    _elog_summary.append({
-                        "Strategy": label,
-                        "Total Events": len(log_df),
-                        "Total Turnover ($)": f"${total_to:,.0f}",
-                        "Avg Turnover/Event ($)": f"${avg_to:,.0f}",
-                        "Threshold Events": int((log_df["reason"] == "threshold").sum()) if "reason" in log_df.columns else "—",
-                        "Calendar Events": int((log_df["reason"] == "calendar").sum()) if "reason" in log_df.columns else "—",
-                    })
-                else:
-                    _elog_summary.append({"Strategy": label, "Total Events": 0, "Total Turnover ($)": "$0",
-                                          "Avg Turnover/Event ($)": "$0", "Threshold Events": 0, "Calendar Events": 0})
-                _elog_sheets[label[:28]] = log_df
-
-            if _elog_summary:
-                _elog_sum_df = pd.DataFrame(_elog_summary)
+            if not _elog_sum_df.empty:
                 st.markdown("#### Rebalancing Event Summary")
                 _es1, _es2 = st.columns([4, 1])
                 with _es1:
@@ -1922,21 +2063,21 @@ if enable_rebalancing:
                         extra_sheets=_elog_sheets,
                     )
 
-            with st.expander("📋 Full Rebalance Event Log"):
-                for label, log_df in event_logs.items():
-                    st.markdown(f"**{label}**")
-                    if not log_df.empty:
-                        st.dataframe(log_df, use_container_width=True, hide_index=True)
+            with st.expander("\U0001f4cb Full Rebalance Event Log"):
+                for _lbl_e, _log_df_e in event_logs.items():
+                    st.markdown(f"**{_lbl_e}**")
+                    if not _log_df_e.empty:
+                        st.dataframe(_log_df_e, use_container_width=True, hide_index=True)
                     else:
                         st.info("No rebalance events triggered.")
 
-        with st.expander("ℹ️ Rebalancing Engine Notes"):
+        with st.expander("\u2139\ufe0f Rebalancing Engine Notes"):
             st.markdown(f"""
 **Calendar:** Rebalances on schedule (Daily / Weekly / Monthly / Quarterly) at closing prices. No transaction costs applied to NAV — see the Est. Cost column in the tables above.
 
 **Threshold (Drift-Band):** Breach detected at close → executes next trading day (no look-ahead). Cooldown suppresses re-triggers for N days post-rebalance.
 
-**Transaction Cost Estimation:** Commission {_commission_bps:.0f} bps + Slippage {_slippage_bps:.0f} bps + Bid-Ask {_bid_ask_bps:.0f} bps = **{_total_cost_rate*10000:.0f} bps total** applied to turnover dollars. Adjust rates in the sidebar.
+**Transaction Cost Estimation:** Commission {_commission_bps_d:.0f} bps + Slippage {_slippage_bps_d:.0f} bps + Bid-Ask {_bid_ask_bps_d:.0f} bps = **{_total_cost_rate_d*10000:.0f} bps total** applied to turnover dollars. Adjust rates in the sidebar.
 
 **MSBA v1 Optimizer:** Full lot-level accounting — costs are actually deducted from cash (not estimated).
 
@@ -1947,199 +2088,73 @@ if enable_rebalancing:
 
 
 # ================================================================
-# MSBA v1 OPTIMIZER SECTION
+# MSBA v1 OPTIMIZER SECTION (read from session_state)
 # ================================================================
-# This section runs two parallel simulations through the tax-aware engine
-# from optimizer_msba_v1_engine.py:
-#   1. Static (static=True): buy-and-hold with TLH only (no rebalancing).
-#      This isolates the value of tax-loss harvesting alone.
-#   2. Optimized (static=False): scheduled rebalancing + TLH + tax-aware lot disposal.
-#      This shows the combined benefit of active management + TLH.
-#
-# Both simulations use IDENTICAL parameters (same tickers, weights, dates, tax
-# rates, TLH threshold) — the only difference is the static flag. This ensures
-# the comparison is apples-to-apples: the "Optimizer Advantage" KPI card
-# directly shows the incremental value of rebalancing on top of TLH.
-#
-# Key architectural difference from the base engine: the optimizer creates actual
-# Portfolio objects with lot-level accounting, cash balances, and realized gain
-# tracking — it's a portfolio ACCOUNTING engine, not just a valuation engine.
 
-if enable_optimizer:
+if opt:
     st.subheader("\U0001f9e0 Optimizer MSBA v1 \u2014 Tax-Aware Simulation")
+    static_result_d = opt["static_result"]
+    opt_result_d = opt["opt_result"]
+    _tlh_df_d = opt["tlh_df"]
 
-    # Attempt to load dividend data. The dividend CSV may not exist in all
-    # deployments (it's optional — the optimizer runs fine without it, just
-    # without dividend processing). If present, it requires a TICKERSYMBOL
-    # column or a TRADINGITEMID column that can be mapped to ticker symbols
-    # using the price dataset. The TRADINGITEMID → TICKERSYMBOL mapping is
-    # necessary because the raw dividend data from Capital IQ uses
-    # TRADINGITEMID as the primary key, not the human-readable ticker symbol.
-    _div_df = None
-    try:
-        import os
-        _div_path = os.path.join(os.path.dirname(__file__), "dividend_data.csv")
-        if os.path.exists(_div_path):
-            _div_df = pd.read_csv(_div_path)
-            _div_df["PAYDATE"] = pd.to_datetime(_div_df["PAYDATE"], errors="coerce")
-            _div_df["EXDATE"] = pd.to_datetime(_div_df["EXDATE"], errors="coerce")
-            if "TICKERSYMBOL" not in _div_df.columns:
-                if "TRADINGITEMID" in _div_df.columns and "TRADINGITEMID" in df.columns:
-                    _ticker_map = (
-                        df[["TRADINGITEMID", "TICKERSYMBOL"]]
-                        .drop_duplicates()
-                        .set_index("TRADINGITEMID")["TICKERSYMBOL"]
-                        .to_dict()
-                    )
-                    _div_df["TICKERSYMBOL"] = _div_df["TRADINGITEMID"].map(_ticker_map)
-                    _div_df = _div_df.dropna(subset=["TICKERSYMBOL"])
-    except Exception:
-        _div_df = None
+    s_nav = static_result_d["nav_series"]
+    o_nav = opt_result_d["nav_series"]
+    s_final = s_nav.iloc[-1]
+    o_final = o_nav.iloc[-1]
+    cap = p["initial_capital"]
 
-    _opt_tax_rates = global_tax_rates  # V4: use universal tax rates (not optimizer-specific)
-    _opt_reinvest = opt_div_handling == "Reinvest dividends"
-    _opt_tickers = holdings["Ticker"].tolist()
-    _opt_weights = holdings["Weight"].tolist()
-    # Pass the calendar frequency to the optimizer. If calendar rebalancing is
-    # disabled in the main panel, pass "None" so the optimizer runs as pure
-    # buy-and-hold (the static run) or TLH-only (both runs skip rebalancing).
-    _opt_rebal_freq = selected_freq if enable_calendar_rebal else "None"
+    kc1, kc2, kc3, kc4 = st.columns(4)
+    kc1.metric("Static Final NAV", f"${s_final:,.0f}", delta=f"{(s_final/cap - 1):+.2%}")
+    kc2.metric("Optimized Final NAV", f"${o_final:,.0f}", delta=f"{(o_final/cap - 1):+.2%}")
+    kc3.metric("Optimizer Advantage", f"${o_final - s_final:+,.0f}", delta=f"{((o_final - s_final)/cap):+.4%}")
+    kc4.metric("Total Tax Paid (Opt)", f"${opt_result_d['tax_paid_total']:,.0f}",
+               delta=f"Static: ${static_result_d['tax_paid_total']:,.0f}")
 
-    with st.spinner("Running MSBA v1 Static simulation..."):
-        try:
-            static_result = run_optimizer_simulation(
-                prices_df=df, dividends_df=_div_df,
-                tickers=_opt_tickers, weights=_opt_weights,
-                start_date=str(start_date), end_date=str(end_date),
-                rebalance_frequency=_opt_rebal_freq,
-                tax_rates=_opt_tax_rates, tlh_threshold=opt_tlh_threshold,
-                reinvest_dividends=_opt_reinvest,
-                initial_capital=float(initial_capital),
-                price_field=price_field, static=True, cost_config=_cost_config,
-            )
-        except Exception as e:
-            st.error(f"MSBA v1 Static simulation failed: {e}")
-            static_result = None
+    st.markdown("#### MSBA v1 \u2014 Portfolio NAV Over Time")
+    opt_chart = pd.DataFrame({"Static (TLH only)": s_nav, "Optimized (Rebal + TLH)": o_nav}).dropna()
+    st.line_chart(_safe_chart_cols(opt_chart), color=["#888888", "#e8710a"], use_container_width=True, height=380)
 
-    with st.spinner("Running MSBA v1 Optimized simulation..."):
-        try:
-            opt_result = run_optimizer_simulation(
-                prices_df=df, dividends_df=_div_df,
-                tickers=_opt_tickers, weights=_opt_weights,
-                start_date=str(start_date), end_date=str(end_date),
-                rebalance_frequency=_opt_rebal_freq,
-                tax_rates=_opt_tax_rates, tlh_threshold=opt_tlh_threshold,
-                reinvest_dividends=_opt_reinvest,
-                initial_capital=float(initial_capital),
-                price_field=price_field, static=False, cost_config=_cost_config,
-            )
-        except Exception as e:
-            st.error(f"MSBA v1 Optimized simulation failed: {e}")
-            opt_result = None
+    st.markdown("#### TLH & Tax Summary")
+    _tl1, _tl2 = st.columns([4, 1])
+    with _tl1:
+        st.dataframe(_tlh_df_d, use_container_width=True, hide_index=True)
+    with _tl2:
+        excel_download_button(
+            _tlh_df_d, "tlh_tax_summary.xlsx",
+            label="TLH & Tax Summary", sheet_name="TLH Summary",
+        )
+    st.caption("Net Benefit = Est. Tax Savings \u2212 Tax Paid \u2212 Execution Costs. Positive = TLH added value.")
 
-    if static_result and opt_result:
-        s_nav = static_result["nav_series"]
-        o_nav = opt_result["nav_series"]
-        s_final = s_nav.iloc[-1]
-        o_final = o_nav.iloc[-1]
-        cap = float(initial_capital)
+    with st.expander("\U0001f4cb Optimized Portfolio \u2014 Realized Gains"):
+        _rdf_d = opt_result_d["realized_df"]
+        if not _rdf_d.empty:
+            _rg1, _rg2 = st.columns([5, 1])
+            with _rg1:
+                st.dataframe(_rdf_d, use_container_width=True, hide_index=True)
+            with _rg2:
+                excel_download_button(_rdf_d, "realized_gains.xlsx", label="Realized Gains", sheet_name="Realized")
+        else:
+            st.info("No realized gains/losses.")
 
-        kc1, kc2, kc3, kc4 = st.columns(4)
-        kc1.metric("Static Final NAV", f"${s_final:,.0f}", delta=f"{(s_final/cap - 1):+.2%}")
-        kc2.metric("Optimized Final NAV", f"${o_final:,.0f}", delta=f"{(o_final/cap - 1):+.2%}")
-        kc3.metric("Optimizer Advantage", f"${o_final - s_final:+,.0f}", delta=f"{((o_final - s_final)/cap):+.4%}")
-        kc4.metric("Total Tax Paid (Opt)", f"${opt_result['tax_paid_total']:,.0f}",
-                   delta=f"Static: ${static_result['tax_paid_total']:,.0f}")
-
-        st.markdown("#### MSBA v1 — Portfolio NAV Over Time")
-        opt_chart = pd.DataFrame({"Static (TLH only)": s_nav, "Optimized (Rebal + TLH)": o_nav}).dropna()
-        st.line_chart(_safe_chart_cols(opt_chart), color=["#888888", "#e8710a"], use_container_width=True, height=380)
-
-        # ── TLH + Tax Summary Table ──────────────────────────────────────────
-        st.markdown("#### TLH & Tax Summary")
-        _tlh_rows = []
-        for _lbl, _res in [("Static (TLH only)", static_result), ("Optimized (Rebal+TLH)", opt_result)]:
-            _rdf_tmp = _res.get("realized_df", pd.DataFrame())
-            _losses_harvested = _res.get("losses_harvested", 0.0)
-            _tlh_events = 0
-            if not _rdf_tmp.empty and "gain_loss" in _rdf_tmp.columns:
-                _tlh_events = int((_rdf_tmp["gain_loss"] < 0).sum())
-            _tax_saved = _losses_harvested * _opt_tax_rates.get("st_rate", 0.35)
-            _tx_cost = _res.get("transaction_costs_total", 0.0)
-            _net_benefit = _tax_saved - _tx_cost - _res.get("tax_paid_total", 0.0)
-            _tlh_rows.append({
-                "Scenario": _lbl,
-                "TLH Events (loss lots)": _tlh_events,
-                "Total Losses Harvested ($)": f"${_losses_harvested:,.0f}",
-                "Est. Tax Savings ($)": f"${_tax_saved:,.0f}",
-                "Tax Paid ($)": f"${_res.get('tax_paid_total', 0.0):,.0f}",
-                "Exec Costs ($)": f"${_tx_cost:,.0f}",
-                "Net Benefit ($)": f"${_net_benefit:+,.0f}",
-                "Final NAV ($)": f"${_res['nav_series'].iloc[-1]:,.0f}",
-            })
-        _tlh_df = pd.DataFrame(_tlh_rows)
-        _tl1, _tl2 = st.columns([4, 1])
-        with _tl1:
-            st.dataframe(_tlh_df, use_container_width=True, hide_index=True)
-        with _tl2:
-            excel_download_button(
-                _tlh_df, "tlh_tax_summary.xlsx",
-                label="TLH & Tax Summary", sheet_name="TLH Summary",
-            )
-        st.caption("Net Benefit = Est. Tax Savings − Tax Paid − Execution Costs. Positive = TLH added value.")
-
-        # ── Realized Gains Summary ──────────────────────────────────────────
-        with st.expander("📋 Optimized Portfolio — Realized Gains"):
-            _rdf = opt_result["realized_df"]
-            if not _rdf.empty:
-                _rg1, _rg2 = st.columns([5, 1])
-                with _rg1:
-                    st.dataframe(_rdf, use_container_width=True, hide_index=True)
-                with _rg2:
-                    excel_download_button(
-                        _rdf, "realized_gains.xlsx",
-                        label="Realized Gains", sheet_name="Realized",
-                    )
-            else:
-                st.info("No realized gains/losses.")
-
-        with st.expander("📋 Optimized Portfolio — Trade Log"):
-            _tdf = opt_result["trades_df"]
-            if not _tdf.empty:
-                _tr1, _tr2 = st.columns([5, 1])
-                with _tr1:
-                    st.dataframe(_tdf, use_container_width=True, hide_index=True)
-                with _tr2:
-                    excel_download_button(
-                        _tdf, "trade_log.xlsx",
-                        label="Trade Log", sheet_name="Trades",
-                    )
-            else:
-                st.info("No trades recorded.")
+    with st.expander("\U0001f4cb Optimized Portfolio \u2014 Trade Log"):
+        _tdf_d = opt_result_d["trades_df"]
+        if not _tdf_d.empty:
+            _tr1, _tr2 = st.columns([5, 1])
+            with _tr1:
+                st.dataframe(_tdf_d, use_container_width=True, hide_index=True)
+            with _tr2:
+                excel_download_button(_tdf_d, "trade_log.xlsx", label="Trade Log", sheet_name="Trades")
+        else:
+            st.info("No trades recorded.")
 
     st.markdown("---")
+
 
 # ================================================================
 #  HOLDINGS TABLE
 # ================================================================
-# Format the holdings DataFrame for human-readable display. The raw holdings
-# DataFrame has numeric values; here we convert to formatted strings with
-# currency symbols, percentage signs, and proper alignment. This is purely
-# a presentation layer — the underlying data has already been consumed by
-# all engine functions above.
 
 st.subheader("Per-Holding Detail")
-
-display_df = holdings.copy()
-display_df["Weight"] = display_df["Weight"].apply(lambda x: f"{x:.1%}")
-display_df["Return"] = display_df["Return"].apply(lambda x: f"{x:+.2%}")
-display_df["Gain (%)"] = display_df["Gain (%)"].apply(lambda x: f"{x:+.2%}")
-display_df["Gain ($)"] = display_df["Gain ($)"].apply(lambda x: f"${x:+,.2f}")
-display_df["Start Value"] = display_df["Start Value"].apply(lambda x: f"${x:,.2f}")
-display_df["End Value"] = display_df["End Value"].apply(lambda x: f"${x:,.2f}")
-display_df["Start Price"] = display_df["Start Price"].apply(lambda x: f"${x:.2f}")
-display_df["End Price"] = display_df["End Price"].apply(lambda x: f"${x:.2f}")
-
 _h1, _h2 = st.columns([5, 1])
 with _h1:
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -2149,11 +2164,40 @@ with _h2:
         label="Holdings Detail", sheet_name="Holdings",
     )
 
+
+# ================================================================
+#  DOWNLOAD ALL TABLES
+# ================================================================
+
+st.markdown("---")
+st.subheader("\U0001f4e6 Download All Tables")
+st.caption("Single Excel workbook with every computed table as a separate sheet.")
+_da1, _da2 = st.columns([1, 3])
+with _da1:
+    if export:
+        st.download_button(
+            label="\u2b07 Download All Tables (.xlsx)",
+            data=to_excel_bytes(export),
+            file_name="portfolio_analysis_full.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_all_tables",
+        )
+with _da2:
+    if export:
+        st.caption(f"**{len(export)} sheets:** {' \u00b7 '.join(export.keys())}")
+
+
 # ================================================================
 #  ASSUMPTIONS EXPANDER
 # ================================================================
 
-with st.expander("ℹ️ Assumptions & Methodology"):
+with st.expander("\u2139\ufe0f Assumptions & Methodology"):
+    _comm_d = p["commission_bps"]
+    _slip_d = p["slippage_bps"]
+    _bask_d = p["bid_ask_bps"]
+    _tcr_d = p["total_cost_rate"]
+    _gst_d = p["global_st_rate"]
+    _glt_d = p["global_lt_rate"]
     st.markdown(f"""
 **Data:** Status 1 (active) and 15 (suspended-but-valid) rows only. Start date shifts forward; end date shifts backward to nearest trading day.
 
@@ -2161,11 +2205,13 @@ with st.expander("ℹ️ Assumptions & Methodology"):
 
 **Fractional Shares:** Default. Toggle "Whole shares only" for integer shares with cash residual.
 
-**Transaction Costs (Calendar/Threshold engines):** Estimated at {_total_cost_rate*10000:.0f} bps of turnover (sidebar-configurable). **Not deducted from NAV** — shown as a cost estimate in the tables.
+**Transaction Costs (Calendar/Threshold engines):** Estimated at {_tcr_d*10000:.0f} bps of turnover (sidebar-configurable). **Not deducted from NAV** — shown as a cost estimate in the tables.
 
-**Transaction Costs (MSBA v1 Optimizer):** Deducted from cash on every trade. Commission {_commission_bps:.0f} bps + Slippage {_slippage_bps:.0f} bps + Bid-Ask {_bid_ask_bps:.0f} bps.
+**Transaction Costs (MSBA v1 Optimizer):** Deducted from cash on every trade. Commission {_comm_d:.0f} bps + Slippage {_slip_d:.0f} bps + Bid-Ask {_bask_d:.0f} bps.
 
-**Tax:** ST={global_st_rate:.0%} / LT={global_lt_rate:.0%}. Applied in MSBA v1 optimizer with lot-level tracking and carry-forward netting. Calendar/threshold engines use the rates as an estimation reference only.
+**Tax:** ST={_gst_d:.0%} / LT={_glt_d:.0%}. Applied in MSBA v1 optimizer with lot-level tracking and carry-forward netting. Calendar/threshold engines use the rates as an estimation reference only.
 
 **Sharpe Ratio:** Risk-free rate = 0 throughout.
     """)
+
+# ── END OF DISPLAY SECTION ────────────────────────────────────────────────
