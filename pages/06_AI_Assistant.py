@@ -145,7 +145,7 @@ for msg in st.session_state["ai_chat"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("fig") is not None:
-            st.plotly_chart(msg["fig"], use_container_width=True)
+            st.plotly_chart(msg["fig"], width="stretch")
 
 # ── Chat input ─────────────────────────────────────────────────────────────────
 user_input = st.chat_input(
@@ -239,7 +239,7 @@ if user_input:
         if chart_code:
             fig, err = execute_chart_code(chart_code, _data_ns)
             if fig is not None:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 rendered_fig = fig
             else:
                 st.error(
