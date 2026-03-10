@@ -42,7 +42,7 @@ from agent_tools import (
     describe_namespace,
     execute_chart_code,
     extract_chart_code,
-    load_code_context,
+    load_compact_context,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -58,10 +58,10 @@ if _HAS_UI:
 if "ai_chat" not in st.session_state:
     st.session_state["ai_chat"] = []  # list of {role, content, fig?}
 
-# Load and cache source code once per session (files don't change mid-session)
+# Load compact code summary once per session (~4K tokens vs 31K for full source).
+# Uses verbatim key algorithm snippets so answers remain accurate.
 if "ai_code_ctx" not in st.session_state:
-    with st.spinner("Loading source context…"):
-        st.session_state["ai_code_ctx"] = load_code_context()
+    st.session_state["ai_code_ctx"] = load_compact_context()
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
