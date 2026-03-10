@@ -40,26 +40,12 @@ _SITE_CSS = r"""
 }
 
 /* ════════════════════════════════════════════════════════════════
-   A. NUKE STREAMLIT CHROME — header ribbon, footer, deploy menu
+   A. STREAMLIT CHROME — footer and deploy menu hidden; header kept
    ════════════════════════════════════════════════════════════════ */
-
-header[data-testid="stHeader"] {
-    display: none !important;
-}
-
-.stApp > header { display: none !important; }
-[data-testid="stAppViewContainer"] > div:first-child {
-    padding-top: 0 !important;
-}
-.main .block-container {
-    padding-top: 1.5rem !important;
-}
 
 footer { display: none !important; }
 .reportview-container .main footer { display: none !important; }
 
-#MainMenu { display: none !important; }
-[data-testid="stToolbar"] { display: none !important; }
 button[title="View app in Streamlit Community Cloud"] { display: none !important; }
 
 /* ════════════════════════════════════════════════════════════════
