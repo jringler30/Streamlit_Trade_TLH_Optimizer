@@ -13,6 +13,7 @@ Architecture:
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -105,9 +106,9 @@ with st.sidebar:
 
     model_choice = st.selectbox(
         "Model",
-        ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
         index=0,
-        help="gemini-2.0-flash and gemini-1.5-flash are free tier. gemini-1.5-pro is paid.",
+        help="gemini-1.5-flash and gemini-2.0-flash are free tier. gemini-1.5-pro is paid.",
     )
     max_tokens = st.slider("Max response tokens", 512, 8192, 4096, 512)
 
@@ -276,35 +277,68 @@ if user_input:
             )
         )
 
-    # ── Call Gemini ────────────────────────────────────────────────────────────
+    # ── Call Gemini (with exponential backoff retry) ───────────────────────────
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
+        _contents = history + [
+            _gtypes.Content(role="user", parts=[_gtypes.Part(text=user_input)])
+        ]
+        _config = _gtypes.GenerateContentConfig(
+            system_instruction=_SYSTEM,
+            max_output_tokens=max_tokens,
+            temperature=0.2,
+        )
+
+        raw_text: str = ""
+        _MAX_RETRIES = 3
+        _last_exc = None
+
+        for _attempt in range(_MAX_RETRIES):
             try:
-                client = _genai.Client(api_key=api_key)
-                response = client.models.generate_content(
-                    model=model_choice,
-                    contents=history + [
-                        _gtypes.Content(
-                            role="user",
-                            parts=[_gtypes.Part(text=user_input)],
-                        )
-                    ],
-                    config=_gtypes.GenerateContentConfig(
-                        system_instruction=_SYSTEM,
-                        max_output_tokens=max_tokens,
-                        temperature=0.2,
-                    ),
-                )
-                raw_text: str = response.text
+                with st.spinner(
+                    "Thinking…" if _attempt == 0
+                    else f"Rate limit hit — retrying ({_attempt}/{_MAX_RETRIES - 1})…"
+                ):
+                    client = _genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=model_choice,
+                        contents=_contents,
+                        config=_config,
+                    )
+                    raw_text = response.text
+                break  # success — exit retry loop
+
             except Exception as exc:
-                err_str = str(exc).lower()
-                if "api_key" in err_str or "api key" in err_str or "authentication" in err_str:
-                    st.error("Invalid API key — check the key in the sidebar.")
-                elif "quota" in err_str or "rate" in err_str:
-                    st.error("Rate limit or quota exceeded. Wait a moment and try again.")
+                _last_exc = exc
+                err_str = str(exc)
+                is_rate_limit = (
+                    "429" in err_str
+                    or "quota" in err_str.lower()
+                    or "resource_exhausted" in err_str.lower()
+                    or "rate" in err_str.lower()
+                )
+                if is_rate_limit and _attempt < _MAX_RETRIES - 1:
+                    _wait = 5 * (2 ** _attempt)  # 5s, 10s, 20s
+                    time.sleep(_wait)
+                    continue  # retry
                 else:
-                    st.error(f"Gemini API error: {exc}")
-                st.stop()
+                    break  # non-retryable error or out of retries
+
+        if not raw_text:
+            err_str = str(_last_exc) if _last_exc else "Unknown error"
+            if "401" in err_str or "api_key" in err_str.lower() or "invalid" in err_str.lower():
+                st.error(f"**Authentication failed** — check your API key in the sidebar.\n\n`{err_str}`")
+            elif "404" in err_str or "not found" in err_str.lower():
+                st.error(
+                    f"**Model not found** — try switching to `gemini-1.5-flash` in the sidebar.\n\n`{err_str}`"
+                )
+            elif "429" in err_str or "quota" in err_str.lower() or "resource_exhausted" in err_str.lower():
+                st.error(
+                    f"**Rate limit exceeded** after {_MAX_RETRIES} attempts. "
+                    f"Wait a minute and try again, or switch models.\n\n`{err_str}`"
+                )
+            else:
+                st.error(f"**Gemini API error:**\n\n`{err_str}`")
+            st.stop()
 
         # ── Parse response ─────────────────────────────────────────────────────
         chart_code   = extract_chart_code(raw_text)
