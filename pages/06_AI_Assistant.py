@@ -7,7 +7,7 @@ Capabilities:
 
 Architecture:
   - No LangChain / no vector DB. Full source code in system prompt (fits in context).
-  - Anthropic Claude API via `anthropic` SDK.
+  - Google Gemini API via `google-genai` SDK (free tier: 1,500 req/day, 1M TPM).
   - Chart code executed safely via restricted exec() in agent_tools.execute_chart_code().
   - Reads st.session_state["_r"] to access the same DataFrames the dashboard uses.
 """
@@ -24,10 +24,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 # ── Optional dependencies ──────────────────────────────────────────────────────
 try:
-    import anthropic as _anthropic
-    _HAS_ANTHROPIC = True
+    from google import genai as _genai
+    from google.genai import types as _gtypes
+    _HAS_GEMINI = True
 except ImportError:
-    _HAS_ANTHROPIC = False
+    _HAS_GEMINI = False
 
 try:
     from ui_style import inject_site_css, render_footer
@@ -67,13 +68,16 @@ with st.sidebar:
     st.markdown("### AI Assistant")
 
     # API key — prefer environment variable, fall back to text input
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         api_key = st.text_input(
-            "Anthropic API Key",
+            "Gemini API Key",
             type="password",
-            placeholder="sk-ant-…",
-            help="Get a key at console.anthropic.com. Stored in memory only for this session.",
+            placeholder="AIza…",
+            help=(
+                "Free key from aistudio.google.com — no credit card required. "
+                "Stored in memory only for this session."
+            ),
         )
     else:
         st.success("API key loaded from environment")
@@ -101,8 +105,9 @@ with st.sidebar:
 
     model_choice = st.selectbox(
         "Model",
-        ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+        ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
         index=0,
+        help="gemini-2.0-flash and gemini-1.5-flash are free tier. gemini-1.5-pro is paid.",
     )
     max_tokens = st.slider("Max response tokens", 512, 8192, 4096, 512)
 
@@ -153,28 +158,28 @@ with st.expander("Example questions", expanded=False):
 
 st.markdown("---")
 
-# ── Guard: missing anthropic library ──────────────────────────────────────────
-if not _HAS_ANTHROPIC:
+# ── Guard: missing google-genai library ───────────────────────────────────────
+if not _HAS_GEMINI:
     st.error(
-        "The `anthropic` package is not installed.\n\n"
-        "```\npip install anthropic\n```\n\n"
+        "The `google-genai` package is not installed.\n\n"
+        "```\npip install google-genai\n```\n\n"
         "Add it to `requirements.txt` and restart the app."
     )
     st.stop()
 
 if not api_key:
-    st.info("Enter your Anthropic API key in the sidebar to start chatting.")
+    st.info(
+        "Enter your Gemini API key in the sidebar to start chatting.  \n"
+        "Get a free key (no credit card) at **aistudio.google.com**."
+    )
     st.stop()
 
 # ── Build data namespace from latest session state ─────────────────────────────
-# Re-built on each render so the agent always sees the most current data.
 _r_current = st.session_state.get("_r") or {}
 _data_ns    = build_data_namespace(_r_current) if _r_current else {}
 _data_desc  = describe_namespace(_data_ns)
 
 # ── System prompt ──────────────────────────────────────────────────────────────
-# Rebuilt each render to reflect the latest data state.
-# Code context is read from session cache (loaded once at startup).
 _SYSTEM = f"""You are a technical AI assistant embedded inside a Streamlit portfolio analytics dashboard, built as part of a UT Austin MSBA capstone project in collaboration with Vise.
 
 This dashboard is a tax-loss harvesting (TLH) and portfolio rebalancing optimization tool. It lets users compare buy-and-hold, calendar rebalancing (Daily/Weekly/Monthly/Quarterly), and threshold/drift-band rebalancing strategies — with a full tax-aware lot-level simulation engine for TLH and dividends.
@@ -226,7 +231,6 @@ The code runs in a sandboxed exec() namespace.
 - Do NOT use `open()`, `os`, `sys`, `exec`, `eval`, or `__import__`
 - Check for missing data before plotting: `if obj is not None and len(obj) > 0:`
 - If the data needed for a chart is not available, explain what the user needs to compute first
-  (e.g., "Enable rebalancing in the sidebar and re-run to get comparison_df")
 
 ## Behavioral Guidelines
 - For code questions: always inspect the source below and cite specifically
@@ -258,34 +262,48 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Build message list for the API (text content only — no figures)
-    api_messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in st.session_state["ai_chat"]
-    ]
+    # ── Build Gemini conversation history ──────────────────────────────────────
+    # Gemini uses role "user" / "model" (not "assistant")
+    # Exclude the message we just appended (it becomes the current turn)
+    history = []
+    prior_msgs = st.session_state["ai_chat"][:-1]  # all but the current user message
+    for m in prior_msgs:
+        gemini_role = "model" if m["role"] == "assistant" else "user"
+        history.append(
+            _gtypes.Content(
+                role=gemini_role,
+                parts=[_gtypes.Part(text=m["content"])],
+            )
+        )
 
-    # ── Call Claude ────────────────────────────────────────────────────────────
+    # ── Call Gemini ────────────────────────────────────────────────────────────
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
-                client = _anthropic.Anthropic(api_key=api_key)
-                response = client.messages.create(
+                client = _genai.Client(api_key=api_key)
+                response = client.models.generate_content(
                     model=model_choice,
-                    max_tokens=max_tokens,
-                    system=_SYSTEM,
-                    messages=api_messages,
+                    contents=history + [
+                        _gtypes.Content(
+                            role="user",
+                            parts=[_gtypes.Part(text=user_input)],
+                        )
+                    ],
+                    config=_gtypes.GenerateContentConfig(
+                        system_instruction=_SYSTEM,
+                        max_output_tokens=max_tokens,
+                        temperature=0.2,
+                    ),
                 )
-                raw_text: str = response.content[0].text
-            except _anthropic.AuthenticationError:
-                st.error(
-                    "Authentication failed — check that your API key is correct."
-                )
-                st.stop()
-            except _anthropic.RateLimitError:
-                st.error("Rate limit hit. Wait a moment and try again.")
-                st.stop()
+                raw_text: str = response.text
             except Exception as exc:
-                st.error(f"API error: {exc}")
+                err_str = str(exc).lower()
+                if "api_key" in err_str or "api key" in err_str or "authentication" in err_str:
+                    st.error("Invalid API key — check the key in the sidebar.")
+                elif "quota" in err_str or "rate" in err_str:
+                    st.error("Rate limit or quota exceeded. Wait a moment and try again.")
+                else:
+                    st.error(f"Gemini API error: {exc}")
                 st.stop()
 
         # ── Parse response ─────────────────────────────────────────────────────
@@ -297,7 +315,6 @@ if user_input:
         # ── Execute and render chart (if present) ──────────────────────────────
         rendered_fig = None
         if chart_code:
-            # Always pull the freshest data from session state at execution time
             current_r  = st.session_state.get("_r") or {}
             current_ns = build_data_namespace(current_r) if current_r else {}
 
@@ -309,7 +326,7 @@ if user_input:
                 st.error(
                     f"**Chart execution failed.** The agent's code raised an error:\n"
                     f"```\n{err}\n```\n"
-                    f"You can ask the agent to fix it by replying: *'Fix the chart error above.'*"
+                    f"Reply *'Fix the chart error above'* and the agent will correct it."
                 )
 
     # ── Persist to chat history ────────────────────────────────────────────────
