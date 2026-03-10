@@ -106,9 +106,13 @@ with st.sidebar:
 
     model_choice = st.selectbox(
         "Model",
-        ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+        ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
         index=0,
-        help="gemini-1.5-flash and gemini-2.0-flash are free tier. gemini-1.5-pro is paid.",
+        help=(
+            "gemini-1.5-flash: free tier, stable API. "
+            "gemini-2.0-flash: free tier but may be unavailable on some accounts. "
+            "gemini-1.5-pro: paid tier."
+        ),
     )
     max_tokens = st.slider("Max response tokens", 512, 8192, 4096, 512)
 
@@ -292,13 +296,20 @@ if user_input:
         _MAX_RETRIES = 3
         _last_exc = None
 
+        # gemini-1.5-x are stable models → v1 API
+        # gemini-2.0-x and newer are experimental → v1beta API
+        _api_version = "v1beta" if "2." in model_choice or "2.5" in model_choice else "v1"
+
         for _attempt in range(_MAX_RETRIES):
             try:
                 with st.spinner(
                     "Thinking…" if _attempt == 0
                     else f"Rate limit hit — retrying ({_attempt}/{_MAX_RETRIES - 1})…"
                 ):
-                    client = _genai.Client(api_key=api_key)
+                    client = _genai.Client(
+                        api_key=api_key,
+                        http_options=_gtypes.HttpOptions(api_version=_api_version),
+                    )
                     response = client.models.generate_content(
                         model=model_choice,
                         contents=_contents,
