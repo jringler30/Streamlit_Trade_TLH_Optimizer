@@ -6,4 +6,3 @@ gdown
 pyarrow
 scipy
 openpyxl
-google-genai
