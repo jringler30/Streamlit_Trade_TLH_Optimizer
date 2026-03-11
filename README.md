@@ -1,3 +1,5 @@
+![CI](https://github.com/jringler30/portfolio-tlh-optimizer/actions/workflows/ci.yml/badge.svg)
+
 # 📊 Streamlit Trade TLH Optimizer
 
 ### Tax-Aware Portfolio Simulation & Optimization Engine

@@ -6,3 +6,4 @@ gdown
 pyarrow
 scipy
 openpyxl
+flake8
