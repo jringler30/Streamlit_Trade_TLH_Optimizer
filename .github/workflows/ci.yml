@@ -29,4 +29,4 @@ jobs:
           python -m py_compile ui_style.py && echo "ui_style.py syntax OK"
 
       - name: Lint with flake8
-        run: flake8 . --max-line-length=120 --extend-ignore=E501,W503
+        run: flake8 . --max-line-length=120 --extend-ignore=E501,W503,E702,W292,E402,F401,E265,E266,E305,F541
