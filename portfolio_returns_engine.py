@@ -2192,7 +2192,8 @@ with _da1:
         )
 with _da2:
     if export:
-        st.caption(f"**{len(export)} sheets:** {' \u00b7 '.join(export.keys())}")
+        _sep = " \u00b7 "
+        st.caption(f"**{len(export)} sheets:** {_sep.join(export.keys())}")
 
 
 # ================================================================
