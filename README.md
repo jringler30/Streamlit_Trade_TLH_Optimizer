@@ -22,16 +22,18 @@ Unlike notebook-based workflows, this system exposes portfolio logic through a s
 
 ## Changelog
 
-### v2.3 — March 10, 2026 (Current)
+See all releases on the [GitHub Releases page](https://github.com/jringler30/portfolio-tlh-optimizer/releases).
+
+### [v2.3](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.3) — CI Pipeline & Tabbed Docs (Current)
 - GitHub Actions CI workflow + CI badge
 - Explainer doc pages consolidated into a single tabbed view
 - Experimental AI Assistant added and removed (Anthropic → Gemini; removed due to free-tier rate limits)
-- Restored Streamlit header ribbon (removed header-hiding CSS)
+- Restored Streamlit header ribbon
 
-### v2.2 — March 8, 2026
+### [v2.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.2) — Strategy Recommendation Notebook
 - Added rebalancing strategy recommendation notebook
 
-### v2.1 — March 7, 2026
+### [v2.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.1) — Excel Exports & Transaction Costs
 - Data tables and Excel export for all key result tables
 - Transaction cost modeling: commission, slippage, bid-ask spread inputs in sidebar
 - Strategy ranking output
@@ -39,17 +41,17 @@ Unlike notebook-based workflows, this system exposes portfolio logic through a s
 - Number input for drift tolerance threshold
 - Streamlit state management fixes + Download All Tables button
 
-### v2.0 — March 4, 2026
+### [v2.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.0) — Backtest Analysis
 - Backtest analysis notebook added (`Backtest/portfolio_backtest_vise.md`)
 
-### v1.2 — February 28, 2026
+### [v1.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.2) — Engine Enhancements
 - Enhanced portfolio returns engine with additional documentation and features
 
-### v1.1 — February 25, 2026
+### [v1.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.1) — Threshold Rebalancing
 - Added threshold/drift-band rebalancing with configurable tolerance
 - UI fixes
 
-### v1.0 — February 19, 2026 (Initial Release)
+### [v1.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.0) — Initial Release
 - Main portfolio simulation engine (`portfolio_returns_engine.py`)
 - Tax-aware optimizer engine (`optimizer_msba_v1_engine.py`)
 - Explainer pages 01–05: Core Engine, Tax Engine ST/LT, Sell Handling & TLH, Dividends & Cashflows, Valuation & Performance
