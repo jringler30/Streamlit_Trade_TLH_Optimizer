@@ -6,195 +6,98 @@
 
 ![Dashboard](Dashboard.png)
 
-> Bloomberg-terminal dark UI — Portfolio Returns Calculator with tax-aware optimizer (v4, March 2026)
+---
+
+## Project Overview
+
+The **Portfolio Returns Calculator** is a portfolio analytics and tax-loss harvesting simulation engine built with Streamlit. It allows users to test portfolio allocations, evaluate rebalancing strategies, and measure the impact of tax-aware optimization logic across historical price data.
+
+Developed as part of the **UT Austin MSBA Vise Capstone**, this tool is designed to resemble an institutional-style analytics interface — purpose-built for simulation and backtesting rather than live trading execution.
+
+Core capabilities:
+
+- Historical price-based portfolio simulation with multi-asset support
+- Tax-loss harvesting engine with short-term / long-term gain classification
+- Flexible rebalancing strategies (buy-and-hold through threshold drift-band)
+- Strategy comparison and performance analytics
+- Interactive Streamlit dashboard with Bloomberg-terminal dark theme
 
 ---
 
-## Overview
+## Live Application
 
-The Portfolio Returns Calculator is an interactive portfolio analytics platform designed to simulate investment performance under rebalancing and tax-loss harvesting strategies.
+To run locally:
 
-Developed as part of the **UT Austin MSBA Vise Capstone**, this tool provides a production-style interface for testing portfolio allocation decisions, evaluating tax-aware optimization logic, and visualizing return dynamics across multiple strategy configurations.
-
-Unlike notebook-based workflows, this system exposes portfolio logic through a structured UI intended to resemble institutional portfolio analytics tooling.
-
----
-
-## Changelog
-
-See all releases on the [GitHub Releases page](https://github.com/jringler30/portfolio-tlh-optimizer/releases).
-
-### [v2.3](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.3) — CI Pipeline & Tabbed Docs (Current)
-- GitHub Actions CI workflow + CI badge
-- Explainer doc pages consolidated into a single tabbed view
-- Experimental AI Assistant added and removed (Anthropic → Gemini; removed due to free-tier rate limits)
-- Restored Streamlit header ribbon
-
-### [v2.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.2) — Strategy Recommendation Notebook
-- Added rebalancing strategy recommendation notebook
-
-### [v2.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.1) — Excel Exports & Transaction Costs
-- Data tables and Excel export for all key result tables
-- Transaction cost modeling: commission, slippage, bid-ask spread inputs in sidebar
-- Strategy ranking output
-- Downloadable rebalance event log
-- Number input for drift tolerance threshold
-- Streamlit state management fixes + Download All Tables button
-
-### [v2.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.0) — Backtest Analysis
-- Backtest analysis notebook added (`Backtest/portfolio_backtest_vise.md`)
-
-### [v1.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.2) — Engine Enhancements
-- Enhanced portfolio returns engine with additional documentation and features
-
-### [v1.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.1) — Threshold Rebalancing
-- Added threshold/drift-band rebalancing with configurable tolerance
-- UI fixes
-
-### [v1.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.0) — Initial Release
-- Main portfolio simulation engine (`portfolio_returns_engine.py`)
-- Tax-aware optimizer engine (`optimizer_msba_v1_engine.py`)
-- Explainer pages 01–05: Core Engine, Tax Engine ST/LT, Sell Handling & TLH, Dividends & Cashflows, Valuation & Performance
-- Bloomberg-terminal dark theme (`ui_style.py`, `config.toml`) with `#4fffb0` green accent
-- Historical price loading from Google Drive (parquet)
-- Dividend mapping via `dividend_data.csv`
-- ST/LT capital gains classification, loss carry-forward, DRIP, TAX_OPTIMAL lot selection
-
----
-
-## Core Capabilities
-
-### Portfolio Simulation Engine
-
-* Historical price-based portfolio return calculation
-* Multi-asset support (ETFs, equities, bonds)
-* Weighted allocation modeling
-
-### Rebalancing Framework
-
-Supports configurable rebalance frequencies:
-
-* Daily
-* Weekly
-* Monthly
-* Quarterly
-* Threshold/drift-band with cooldown
-
-Automatically tracks:
-
-* Holdings drift
-* Trade execution
-* Allocation restoration
-
----
-
-### Tax-Loss Harvesting Logic
-
-The optimizer includes a tax-aware simulation layer that:
-
-* Detects unrealized losses exceeding a configurable threshold
-* Simulates sell-and-replace TLH actions with immediate rebuy
-* Tracks realized gains/losses with ST/LT classification
-* Updates cost basis after trades
-* Carries forward unused losses across periods
-
-This allows users to evaluate the potential tax impact of systematic rebalancing decisions.
-
----
-
-### Cashflow & Dividend Handling
-
-* Dividend mapping via external dataset
-* Cash accumulation between events
-* Dividend reinvestment (DRIP) into portfolio weights — each reinvestment creates a new lot
-
----
-
-### AI Assistant (Page 06)
-
-* Claude-powered chat interface embedded in the Streamlit app
-* Full source code injected into system prompt for context-aware answers
-* Capable of generating and executing custom Plotly charts on live portfolio data
-* Requires `ANTHROPIC_API_KEY` environment variable or sidebar input
-
----
-
-### Interactive Dashboard (Streamlit)
-
-The UI includes:
-
-* Portfolio configuration panel (tickers, weights, dates)
-* Holdings weight editor
-* Strategy toggle controls
-* Rebalancing frequency and threshold controls
-* Transaction cost configuration (commission, slippage, bid-ask)
-* Return comparison outputs with performance metrics
-* Performance visualization (Portfolio Value vs Cost Basis, drawdown, etc.)
-* Excel download for all key result tables
-
-Custom styling includes a **Bloomberg-terminal inspired dark theme**.
-
----
-
-## Architecture
-
-```
-User Inputs (Tickers / Weights / Dates)
-        ↓
-Portfolio Engine (portfolio_returns_engine.py)
-        ↓
-Rebalancing Logic (V1–V4)
-        ↓
-Tax Optimization Layer (optimizer_msba_v1_engine.py)
-        ↓
-Cashflow / Dividend Processing (DRIP)
-        ↓
-Performance Calculation (Sharpe, IR, drawdown, etc.)
-        ↓
-Streamlit Visualization Layer + AI Assistant
+```bash
+streamlit run portfolio_returns_engine.py
 ```
 
+The dashboard will open in your browser at `http://localhost:8501`.
+
 ---
 
-## Repository Structure
+## Key Features
+
+| Feature | Description |
+|---|---|
+| Portfolio Simulation Engine | Historical return calculation across multi-asset portfolios |
+| Tax-Loss Harvesting Logic | Detects unrealized losses, simulates sell-and-rebuy, tracks ST/LT gains |
+| Flexible Rebalancing Strategies | Daily, Weekly, Monthly, Quarterly, and threshold drift-band |
+| Backtesting Engine | Jupyter notebooks for strategy backtesting and comparison |
+| Interactive Dashboard | Streamlit UI with sidebar controls and live chart updates |
+| Portfolio Allocation Visualization | Portfolio value vs cost basis, drawdown, and drift charts |
+| Strategy Comparison | Side-by-side metrics: CAGR, Sharpe, max drawdown, tracking error, IR |
+| Excel Export | Download all result tables directly from the dashboard |
+| Transaction Cost Modeling | Commission, slippage, and bid-ask spread inputs in sidebar |
+
+---
+
+## Project Architecture
 
 ```
 portfolio-tlh-optimizer/
 │
-├── portfolio_returns_engine.py   # Main Streamlit app + simulation logic
-├── optimizer_msba_v1_engine.py   # Tax-aware optimization engine
-├── agent_tools.py                # AI assistant utilities
-├── ui_style.py                   # Bloomberg dark theme + helper functions
-├── dividend_data.csv             # Dividend reference dataset
-├── requirements.txt              # Python dependencies
+├── portfolio_returns_engine.py        # Main Streamlit app + simulation logic
+├── optimizer_msba_v1_engine.py        # Tax-aware optimization engine (TLH + lot tracking)
+├── ui_style.py                        # Bloomberg dark theme + CSS helpers
+├── dividend_data.csv                  # Dividend reference dataset
+├── requirements.txt                   # Python dependencies
+├── LICENSE
+├── README.md
 │
 ├── pages/
-│   ├── 01_Core_Engine_Overview.py
-│   ├── 02_Tax_Engine_ST_vs_LT.py
-│   ├── 03_Sell_Handling_and_TLH.py
-│   ├── 04_Dividends_and_Cashflows.py
-│   ├── 05_Valuation_and_Performance.py
-│   └── 06_AI_Assistant.py
+│   └── 01_Engine_Documentation.py    # Tabbed engine documentation (all 5 topics)
 │
-├── .streamlit/
-│   └── config.toml               # Dark theme, accent #4fffb0
+├── Backtest/
+│   ├── portfolio_backtest_vise.md             # Backtest analysis report
+│   ├── vise_tlh_backtest_monthly_v2.ipynb     # TLH backtest notebook
+│   ├── vise_rebalancing_recommendation.ipynb  # Rebalancing strategy notebook
+│   └── portfolio_backtest_vise_files/         # Backtest chart images
 │
-└── Backtest/
-    └── portfolio_backtest_vise.md
+└── .streamlit/
+    └── config.toml                    # Dark theme config (primaryColor #4fffb0)
 ```
 
 ---
 
 ## Installation
 
-Clone repository:
+**Clone the repository:**
 
 ```bash
 git clone https://github.com/jringler30/portfolio-tlh-optimizer.git
 cd portfolio-tlh-optimizer
 ```
 
-Install dependencies:
+**Create and activate a virtual environment:**
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Mac/Linux
+venv\Scripts\activate           # Windows
+```
+
+**Install dependencies:**
 
 ```bash
 pip install -r requirements.txt
@@ -208,50 +111,71 @@ pip install -r requirements.txt
 streamlit run portfolio_returns_engine.py
 ```
 
-The dashboard will launch in your browser.
+The app loads price data from Google Drive on first run (requires internet connection). Subsequent runs use the cached local parquet file.
 
 ---
 
-## Example Workflow
+## Example Use Cases
 
-1. Select number of holdings
-2. Enter ticker symbols
-3. Assign portfolio weights
-4. Choose investment horizon
-5. Configure rebalancing strategy and transaction costs
-6. Toggle TLH optimizer
-7. Run simulation
+- Simulate a 3-asset portfolio (e.g. SPY / AGG / QQQ) across a custom date range
+- Compare buy-and-hold vs. monthly rebalancing vs. threshold drift-band rebalancing
+- Evaluate how tax-loss harvesting thresholds affect after-tax returns
+- Visualize portfolio drawdown and value vs. cost basis over time
+- Export strategy comparison tables to Excel for further analysis
+- Run the backtest notebooks to evaluate TLH performance across market regimes
 
-The engine will compute:
+---
 
-* Portfolio value trajectory
-* Strategy comparison outputs (Buy & Hold vs. Rebalanced vs. Optimized)
-* Trade counts and transaction costs
-* Gain/loss tracking with tax impact
+## Engine Documentation
+
+The **Engine Documentation** page (accessible from the sidebar) covers five topics in a tabbed layout:
+
+1. **Core Engine Overview** — simulation loop, V1–V4 engine progression
+2. **Tax Engine ST vs LT** — short/long-term classification, carry-forward netting
+3. **Sell Handling & TLH** — lot selection modes (FIFO / LIFO / TAX_OPTIMAL), TLH logic
+4. **Dividends & Cashflows** — DRIP reinvestment, lot creation, cash handling
+5. **Valuation & Performance** — daily NAV calculation, metrics, edge cases
+
+---
+
+## Version History
+
+See all releases on the [GitHub Releases page](https://github.com/jringler30/portfolio-tlh-optimizer/releases).
+
+| Version | Release | Summary |
+|---|---|---|
+| [v2.3](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.3) | Current | CI pipeline, tabbed engine docs |
+| [v2.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.2) | — | Strategy recommendation notebook |
+| [v2.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.1) | — | Excel exports, transaction costs, event log |
+| [v2.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.0) | — | Backtest analysis added |
+| [v1.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.2) | — | Engine enhancements |
+| [v1.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.1) | — | Threshold rebalancing + UI fixes |
+| [v1.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v1.0) | — | Initial release |
 
 ---
 
 ## Technology Stack
 
-* Python
-* Streamlit
-* Pandas / NumPy
-* Plotly
-* Anthropic Claude API (AI Assistant)
-* openpyxl (Excel export)
+| Layer | Libraries |
+|---|---|
+| UI | Streamlit, custom CSS (Bloomberg dark theme) |
+| Data | Pandas, NumPy, PyArrow, gdown |
+| Analytics | SciPy, Plotly |
+| Export | openpyxl |
+| CI | GitHub Actions (Python 3.11, flake8) |
 
 ---
 
 ## Intended Use
 
-This system is designed for:
+This project is designed for:
 
-* Portfolio strategy experimentation
-* Tax-aware optimization simulation
-* Financial analytics demonstrations
-* Capstone research deliverables
+- Portfolio strategy experimentation
+- Tax-aware optimization simulation
+- Financial analytics demonstrations
+- Capstone research and academic deliverables
 
-This project is **not intended for live trading execution**.
+**Not intended for live trading execution.**
 
 ---
 
@@ -264,4 +188,4 @@ MS Business Analytics — University of Texas at Austin
 
 ## License
 
-MIT License
+[MIT License](LICENSE)

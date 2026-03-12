@@ -1,9 +1,12 @@
+# Core dependencies
 streamlit
 pandas
 numpy
 plotly
+scipy
 gdown
 pyarrow
-scipy
 openpyxl
+
+# Development
 flake8
