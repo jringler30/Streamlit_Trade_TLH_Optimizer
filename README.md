@@ -22,33 +22,41 @@ Unlike notebook-based workflows, this system exposes portfolio logic through a s
 
 ## Changelog
 
-### v4 — March 2026 (Current)
-- Threshold/drift-band rebalancing with configurable cooldown period
-- Full rebalance event log with trade-level detail
-- Enhanced performance metrics: skewness, kurtosis, tracking error, information ratio
-- AI Assistant page (page 06) — Claude-powered chat with full source code context, capable of generating custom charts
-- Transaction cost configuration: commission, slippage, and bid-ask spread inputs in sidebar
-- Excel export for all key tables via paired download buttons
-- Bloomberg-terminal dark theme with `#4fffb0` green accent
+### v2.3 — March 10, 2026 (Current)
+- GitHub Actions CI workflow + CI badge
+- Explainer doc pages consolidated into a single tabbed view
+- Experimental AI Assistant added and removed (Anthropic → Gemini; removed due to free-tier rate limits)
+- Restored Streamlit header ribbon (removed header-hiding CSS)
 
-### v3 — Early 2026
-- Calendar-based rebalancing: Daily / Weekly / Monthly / Quarterly
-- Explainer documentation pages (pages 01–05): Core Engine, Tax Engine ST/LT, Sell Handling & TLH, Dividends & Cashflows, Valuation & Performance
-- MSBA v1 optimizer: full cost deduction from cash on buy/sell, `DEFAULT_COST_CONFIG` parameter
+### v2.2 — March 8, 2026
+- Added rebalancing strategy recommendation notebook
 
-### v2 — Late 2025
-- Daily rebalancing engine
-- Short-term vs. long-term capital gains classification (ST=35%, LT=20%)
-- Loss carry-forward netting across tax years
-- DRIP dividend reinvestment with per-lot tracking
-- TAX_OPTIMAL lot selection (FIFO / LIFO / Tax-Optimal)
+### v2.1 — March 7, 2026
+- Data tables and Excel export for all key result tables
+- Transaction cost modeling: commission, slippage, bid-ask spread inputs in sidebar
+- Strategy ranking output
+- Downloadable rebalance event log
+- Number input for drift tolerance threshold
+- Streamlit state management fixes + Download All Tables button
 
-### v1 — Initial Release
-- Buy-and-hold portfolio with daily price series
-- Multi-asset support (ETFs, equities, bonds)
+### v2.0 — March 4, 2026
+- Backtest analysis notebook added (`Backtest/portfolio_backtest_vise.md`)
+
+### v1.2 — February 28, 2026
+- Enhanced portfolio returns engine with additional documentation and features
+
+### v1.1 — February 25, 2026
+- Added threshold/drift-band rebalancing with configurable tolerance
+- UI fixes
+
+### v1.0 — February 19, 2026 (Initial Release)
+- Main portfolio simulation engine (`portfolio_returns_engine.py`)
+- Tax-aware optimizer engine (`optimizer_msba_v1_engine.py`)
+- Explainer pages 01–05: Core Engine, Tax Engine ST/LT, Sell Handling & TLH, Dividends & Cashflows, Valuation & Performance
+- Bloomberg-terminal dark theme (`ui_style.py`, `config.toml`) with `#4fffb0` green accent
 - Historical price loading from Google Drive (parquet)
 - Dividend mapping via `dividend_data.csv`
-- Basic Streamlit UI with portfolio weight editor
+- ST/LT capital gains classification, loss carry-forward, DRIP, TAX_OPTIMAL lot selection
 
 ---
 
