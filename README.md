@@ -70,8 +70,9 @@ portfolio-tlh-optimizer/
 │
 ├── Backtest/
 │   ├── portfolio_backtest_vise.md             # Backtest analysis report
-│   ├── vise_tlh_backtest_monthly_v2.ipynb     # TLH backtest notebook
+│   ├── vise_tlh_backtest_monthly_v2.ipynb     # Full TLH backtest (multi-strategy)
 │   ├── vise_rebalancing_recommendation.ipynb  # Rebalancing strategy notebook
+│   ├── tlh_multi_security_prototype.ipynb     # 10-security TLH prototype (new)
 │   └── portfolio_backtest_vise_files/         # Backtest chart images
 │
 └── .streamlit/
@@ -144,7 +145,8 @@ See all releases on the [GitHub Releases page](https://github.com/jringler30/por
 
 | Version | Release | Summary |
 |---|---|---|
-| [v2.3](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.3) | Current | CI pipeline, tabbed engine docs |
+| [v2.4](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.4) | Current | 10-security TLH prototype notebook with wash sale enforcement |
+| [v2.3](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.3) | — | CI pipeline, tabbed engine docs |
 | [v2.2](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.2) | — | Strategy recommendation notebook |
 | [v2.1](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.1) | — | Excel exports, transaction costs, event log |
 | [v2.0](https://github.com/jringler30/portfolio-tlh-optimizer/releases/tag/v2.0) | — | Backtest analysis added |
