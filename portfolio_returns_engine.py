@@ -1094,6 +1094,38 @@ def load_data():
 df = load_data()
 available_tickers = sorted(df["TICKERSYMBOL"].astype(str).str.strip().str.upper().unique())
 
+
+# ================================================================
+#  LOAD PROXY LOOKUP TABLE
+# ================================================================
+
+@st.cache_data(show_spinner=False)
+def load_proxy_lookup():
+    """Load TLH proxy pairs from proxy_lookup.csv (automatic, no user input needed)."""
+    try:
+        proxy_path = Path(__file__).resolve().parent / "proxy_lookup.csv"
+        if not proxy_path.exists():
+            return None
+        proxy_df = pd.read_csv(proxy_path)
+        # Ensure required columns exist
+        required = ["symbol", "lookup_symbol", "order"]
+        if not all(col in proxy_df.columns for col in required):
+            return None
+        # Normalize to uppercase
+        proxy_df["symbol"] = proxy_df["symbol"].astype(str).str.strip().str.upper()
+        proxy_df["lookup_symbol"] = proxy_df["lookup_symbol"].astype(str).str.strip().str.upper()
+        proxy_df["order"] = pd.to_numeric(proxy_df["order"], errors="coerce").astype("Int64")
+        # Drop rows with missing critical fields
+        proxy_df = proxy_df.dropna(subset=["symbol", "lookup_symbol", "order"])
+        return proxy_df
+    except Exception as e:
+        st.warning(f"Could not load proxy_lookup.csv: {e}")
+        return None
+
+
+proxy_lookup_full = load_proxy_lookup()
+
+
 # ================================================================
 #  SIDEBAR -- USER INPUTS
 # ================================================================
@@ -1283,11 +1315,71 @@ if _OPTIMIZER_AVAILABLE:
             ["Reinvest dividends", "Keep dividends as cash"],
             key="opt_div",
         )
+        # ── Automatically build proxy DataFrame from proxy_lookup.csv ─────────────────
+        _proxy_df_ui = None
+        _tickers_without_proxies = []
+
+        if proxy_lookup_full is not None and not proxy_lookup_full.empty:
+            # Filter proxy_lookup to only the selected tickers
+            _matching_proxies = proxy_lookup_full[
+                proxy_lookup_full["symbol"].isin(ticker_inputs)
+            ].copy()
+            if not _matching_proxies.empty:
+                # Include lookup_type (required by ProxyResolver in optimizer)
+                _proxy_df_ui = _matching_proxies[["symbol", "lookup_type", "lookup_symbol", "order"]]
+
+                # Display proxy info in sidebar
+                st.sidebar.markdown("**TLH Proxy Tickers** *(auto-loaded from proxy_lookup.csv)*")
+                _proxy_display = []
+                for _ticker in ticker_inputs:
+                    _ticker_upper = _ticker.upper()
+                    _ticker_proxies = _matching_proxies[
+                        _matching_proxies["symbol"] == _ticker_upper
+                    ].sort_values("order")
+                    if not _ticker_proxies.empty:
+                        _proxy_list = [f"{row['lookup_symbol']} (#{int(row['order'])})"
+                                      for _, row in _ticker_proxies.iterrows()]
+                        _proxy_display.append(f"**{_ticker_upper}** → {', '.join(_proxy_list)}")
+                    else:
+                        _tickers_without_proxies.append(_ticker_upper)
+
+                if _proxy_display:
+                    st.sidebar.caption("\n".join(_proxy_display))
+
+                # Show warning for tickers without proxies
+                if _tickers_without_proxies:
+                    st.sidebar.warning(
+                        f"⚠️ **TLH disabled** for {', '.join(_tickers_without_proxies)} "
+                        f"(no proxies configured). These tickers will not be tax-loss harvested "
+                        f"to avoid 30-day cash drag."
+                    )
+            else:
+                st.sidebar.caption("ℹ️ No proxies found for selected tickers.")
+                _tickers_without_proxies = ticker_inputs
+        else:
+            st.sidebar.caption("ℹ️ Proxies not configured (proxy_lookup.csv missing or no matches).")
+            _tickers_without_proxies = ticker_inputs if enable_optimizer else []
+
+        _wash_sale_days_ui = st.sidebar.number_input(
+            "Wash-sale window (days)", min_value=0, max_value=60, value=30, step=1, key="opt_wsd",
+            help="Calendar days after a TLH loss sale during which buys of the original are redirected to a proxy.",
+        )
+        _tlh_mode_ui = st.sidebar.selectbox(
+            "TLH Threshold Mode",
+            ["explicit", "rule_of_thumb"], index=0, key="opt_tlh_mode",
+            help="rule_of_thumb: 15% for Daily cadence, 10% otherwise. explicit: uses the threshold above.",
+        )
     else:
         opt_tlh_threshold = 0.05
         opt_div_handling = "Reinvest dividends"
+        _proxy_df_ui = None
+        _wash_sale_days_ui = 30
+        _tlh_mode_ui = "explicit"
 else:
     enable_optimizer = False
+    _proxy_df_ui = None
+    _wash_sale_days_ui = 30
+    _tlh_mode_ui = "explicit"
 
 # ================================================================
 # TRANSACTION COST SIDEBAR
@@ -1680,6 +1772,10 @@ if run_btn:
                     reinvest_dividends=_opt_reinvest,
                     initial_capital=float(initial_capital),
                     price_field=price_field, static=True, cost_config=_cost_config,
+                    proxy_df=_proxy_df_ui,
+                    wash_sale_days=int(_wash_sale_days_ui),
+                    tlh_threshold_mode=_tlh_mode_ui,
+                    compute_tax_alpha=True,
                 )
             except Exception as e:
                 st.error(f"MSBA v1 Static simulation failed: {e}")
@@ -1695,6 +1791,10 @@ if run_btn:
                     reinvest_dividends=_opt_reinvest,
                     initial_capital=float(initial_capital),
                     price_field=price_field, static=False, cost_config=_cost_config,
+                    proxy_df=_proxy_df_ui,
+                    wash_sale_days=int(_wash_sale_days_ui),
+                    tlh_threshold_mode=_tlh_mode_ui,
+                    compute_tax_alpha=True,
                 )
             except Exception as e:
                 st.error(f"MSBA v1 Optimized simulation failed: {e}")
@@ -1707,9 +1807,15 @@ if run_btn:
                 _tlh_ev = 0
                 if not _rdf_tmp.empty and "gain_loss" in _rdf_tmp.columns:
                     _tlh_ev = int((_rdf_tmp["gain_loss"] < 0).sum())
+                # Legacy estimate retained for reference; engine now also returns tax alpha series.
                 _tax_saved_o = _losses_h * _opt_tax_rates.get("st_rate", 0.35)
                 _tx_cost_o = _res_o.get("transaction_costs_total", 0.0)
                 _net_ben = _tax_saved_o - _tx_cost_o - _res_o.get("tax_paid_total", 0.0)
+                _ta2 = _res_o.get("tax_alpha_2_final", np.nan)
+                _ta2_pct = (_ta2 / float(initial_capital)) if (isinstance(_ta2, (int, float)) and float(initial_capital) > 0) else np.nan
+                _oi_used = _res_o.get("ordinary_income_offset_used_ytd_final", np.nan)
+                _cf_st = _res_o.get("loss_carryforward_st", np.nan)
+                _cf_lt = _res_o.get("loss_carryforward_lt", np.nan)
                 _tlh_rows_opt.append({
                     "Scenario": _lbl_o,
                     "TLH Events (loss lots)": _tlh_ev,
@@ -1718,6 +1824,11 @@ if run_btn:
                     "Tax Paid ($)": f"${_res_o.get('tax_paid_total', 0.0):,.0f}",
                     "Exec Costs ($)": f"${_tx_cost_o:,.0f}",
                     "Net Benefit ($)": f"${_net_ben:+,.0f}",
+                    "Tax Alpha 2 ($)": f"${_ta2:+,.0f}" if np.isfinite(_ta2) else "—",
+                    "Tax Alpha 2 (% cap)": f"{_ta2_pct:+.2%}" if np.isfinite(_ta2_pct) else "—",
+                    "Ordinary Offset Used (YTD, $<=3000)": f"${_oi_used:,.0f}" if np.isfinite(_oi_used) else "—",
+                    "Loss CF (ST)": f"${_cf_st:,.0f}" if np.isfinite(_cf_st) else "—",
+                    "Loss CF (LT)": f"${_cf_lt:,.0f}" if np.isfinite(_cf_lt) else "—",
                     "Final NAV ($)": f"${_res_o['nav_series'].iloc[-1]:,.0f}",
                 })
             _tlh_df_opt = pd.DataFrame(_tlh_rows_opt)
@@ -2132,6 +2243,16 @@ if opt:
             label="TLH & Tax Summary", sheet_name="TLH Summary",
         )
     st.caption("Net Benefit = Est. Tax Savings \u2212 Tax Paid \u2212 Execution Costs. Positive = TLH added value.")
+
+    # Tax Alpha time-series chart
+    _alpha2_s = opt_result_d.get("tax_alpha_2_series")
+    if _alpha2_s is not None:
+        st.markdown("#### Tax Alpha Over Time (Optimized Run)")
+        _alpha_chart_df = pd.DataFrame(index=opt_result_d["nav_series"].index)
+        _alpha_chart_df["Alpha 2 (TLH vs no-TLH baseline, $)"] = _alpha2_s.values
+        _alpha_chart_df.index.name = "Date"
+        st.line_chart(_alpha_chart_df)
+        st.caption("Alpha 2 — NAV difference between the TLH portfolio and an identical portfolio with no harvesting.")
 
     with st.expander("\U0001f4cb Optimized Portfolio \u2014 Realized Gains"):
         _rdf_d = opt_result_d["realized_df"]
