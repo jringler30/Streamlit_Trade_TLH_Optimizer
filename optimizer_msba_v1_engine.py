@@ -620,6 +620,7 @@ def run_optimizer_simulation(
     drift_tolerance: Optional[float] = None,
     drift_mode: str = "Absolute",
     drift_cooldown: int = 0,
+    forced_rebalance_dates: Optional[set] = None,
 ) -> dict:
     """
     Run the MSBA v1 tax-aware portfolio simulation.
@@ -642,6 +643,8 @@ def run_optimizer_simulation(
                          drifts beyond this tolerance (e.g. 0.05 = 5%)
     drift_mode         : "Absolute" (percentage points) | "Relative" (proportional)
     drift_cooldown     : days to suppress drift re-triggers after a drift rebalance
+    forced_rebalance_dates : optional set of dates to force rebalancing (e.g. from
+                        pre-computed threshold triggers); merged with rebal_dates
 
     Returns
     -------
@@ -710,6 +713,8 @@ def run_optimizer_simulation(
         rebal_dates = set()
     else:
         rebal_dates = _build_rebalance_set(trading_dates, rebalance_frequency)
+    if forced_rebalance_dates:
+        rebal_dates = rebal_dates | {pd.Timestamp(d) for d in forced_rebalance_dates}
 
     # ── Drift-band rebalancing state ───────────────────────────────────────────
     drift_cooldown_remaining = 0
