@@ -375,8 +375,8 @@ def test_tax_engine_ordinary_offset_cap_and_carryforward():
     dates = business_dates("2022-10-03", 105)  # Oct 2022 – Mar 2023
     spy_prices = [100.0] * 35 + [60.0] * (len(dates) - 35)   # drops on day 35 (2022)
     qqq_prices = [100.0] * 80 + [85.0] * (len(dates) - 80)   # drops on day 80 (2023)
-    voo_prices  = [60.0]  * len(dates)   # proxy for SPY
-    qqqm_prices = [85.0]  * len(dates)   # proxy for QQQ
+    voo_prices = [60.0] * len(dates)   # proxy for SPY
+    qqqm_prices = [85.0] * len(dates)   # proxy for QQQ
 
     prices_df = make_prices(
         ["SPY", "QQQ", "VOO", "QQQM"], dates,
@@ -484,7 +484,7 @@ def test_wash_sale_proxy_used_not_original():
     """
     dates = business_dates("2023-01-03", 60)
     spy_prices = [100.0] * 35 + [75.0] * (len(dates) - 35)
-    voo_prices  = [100.0] * 35 + [76.0] * (len(dates) - 35)
+    voo_prices = [100.0] * 35 + [76.0] * (len(dates) - 35)
     prices_df = make_prices(["SPY", "VOO"], dates,
                             {"SPY": spy_prices, "VOO": voo_prices})
     proxy_df = make_proxy_df(("SPY", "VOO"))

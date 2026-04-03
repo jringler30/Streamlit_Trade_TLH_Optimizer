@@ -410,8 +410,8 @@ class Portfolio:
 
     def sell(self, date, ticker: str, shares: float, price: float, lot_selection: str = "TAX_OPTIMAL",
              reason: str = "", *, tax_count_for_this_sale: Optional[callable] = None,
-               on_loss_realized: Optional[callable] = None,
-               check_wash_sale_lookback: Optional[callable] = None):
+             on_loss_realized: Optional[callable] = None,
+             check_wash_sale_lookback: Optional[callable] = None):
         """
         Execute a sell order with lot selection, realize gains/losses, pay taxes.
 

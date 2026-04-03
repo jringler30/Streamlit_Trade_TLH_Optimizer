@@ -1338,7 +1338,7 @@ if _OPTIMIZER_AVAILABLE:
                     ].sort_values("order")
                     if not _ticker_proxies.empty:
                         _proxy_list = [f"{row['lookup_symbol']} (#{int(row['order'])})"
-                                      for _, row in _ticker_proxies.iterrows()]
+                                       for _, row in _ticker_proxies.iterrows()]
                         _proxy_display.append(f"**{_ticker_upper}** → {', '.join(_proxy_list)}")
                     else:
                         _tickers_without_proxies.append(_ticker_upper)
