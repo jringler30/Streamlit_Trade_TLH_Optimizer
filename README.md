@@ -4,7 +4,7 @@
 
 ### Tax-Aware Portfolio Simulation & Optimization Engine
 
-![Dashboard](assets/Dashboard.png)
+![Dashboard](Dashboard.png)
 
 ---
 
