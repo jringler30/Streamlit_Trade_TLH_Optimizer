@@ -827,6 +827,7 @@ def run_optimizer_simulation(
     for i in range(1, n_days):
         dt = trading_dates[i]
         prices_today = {tk: float(wide.loc[dt, tk]) for tk in all_needed_list}
+        tlh_fired_today = False  # reset each day; suppresses drift check if TLH ran
 
         # Daily callbacks (capture current dt from loop)
         def _on_loss_realized(ticker: str, loss_amount: float):
@@ -866,6 +867,7 @@ def run_optimizer_simulation(
                         lots_to_harvest.append((lot["lot_id"], lot["shares"]))
 
                 for lot_id, lot_shares in lots_to_harvest:
+                    tlh_fired_today = True  # suppress drift check this day
                     # Sell the lot (TLH-triggered)
                     px = prices_today[tk]
                     pf.sell(
@@ -889,8 +891,8 @@ def run_optimizer_simulation(
         if dt in rebal_dates:
             _execute_rebalance(dt, "REBAL")
 
-        # 4. Drift-band rebalancing
-        if drift_enabled and drift_cooldown_remaining <= 0:
+        # 4. Drift-band rebalancing (skipped on days TLH fired — proxy already holds the position)
+        if drift_enabled and drift_cooldown_remaining <= 0 and not tlh_fired_today:
             total_nav = pf.nav(prices_today)
             if total_nav > 0:
                 current_weights = {
