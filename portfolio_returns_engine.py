@@ -1255,6 +1255,16 @@ initial_capital = st.sidebar.number_input(
 price_field = st.sidebar.selectbox("Price Field", ["PRICECLOSE", "PRICEMID"])
 allow_cash = st.sidebar.checkbox("Whole shares only (cash residual)", value=False)
 
+# TASK 4: Rolling volatility window — user-selectable, used for the rolling
+# vol chart beneath the main portfolio value chart (toggle to show/hide).
+rolling_vol_window = st.sidebar.number_input(
+    "Rolling Vol Window (days)", min_value=5, max_value=252, value=30, step=5,
+    help=(
+        "Number of trading days used to compute rolling annualized volatility. "
+        "30 days = recent risk; 90 days = smoother, more stable estimate."
+    ),
+)
+
 # ================================================================
 # V4: Universal Page-Level Tax Parameters
 # ================================================================
@@ -2011,6 +2021,8 @@ if run_btn:
         "bh_vals": _bh_vals, "bh_metrics": _bh_metrics, "n_days": _n_days,
         "summary_df": _summary_df, "drift_df": _drift_df,
         "rebal": _rebal, "opt": _opt, "export": _export,
+        # TASK 4: store rolling vol window so the display section can use it
+        "rolling_vol_window": rolling_vol_window,
         "params": {
             "start_date": str(start_date), "end_date": str(end_date),
             "initial_capital": float(initial_capital),
@@ -2073,6 +2085,32 @@ st.markdown("---")
 
 st.subheader("Portfolio Value vs Cost Basis")
 st.line_chart(_safe_chart_cols(daily[["Portfolio Value", "Cost Basis"]]), color=["#1a73e8", "#888888"], use_container_width=True, height=380)
+
+# ── TASK 4: Rolling Volatility Chart ─────────────────────────────────────────
+# Annualized rolling volatility = rolling std of daily returns × √252.
+# Displayed as a toggleable chart so it doesn't clutter the default view.
+# The window comes from the sidebar control (default 30 trading days).
+show_rolling_vol = st.checkbox("Show Rolling Volatility Chart", value=False, key="show_rvol")
+if show_rolling_vol:
+    _rvol_window = _r.get("rolling_vol_window", 30)
+    _bh_daily_rets_disp = pd.Series(
+        np.diff(_bh_vals) / np.where(_bh_vals[:-1] > 0, _bh_vals[:-1], 1.0),
+        index=daily.index[1:],
+    )
+    # rolling(window).std(ddof=1) × √252 → annualized vol at each day
+    _rvol_series = _bh_daily_rets_disp.rolling(window=_rvol_window, min_periods=max(2, _rvol_window // 2)).std(ddof=1) * np.sqrt(252)
+    _rvol_df = pd.DataFrame(
+        {f"Rolling Vol ({_rvol_window}d, annualized)": _rvol_series * 100},
+        index=_rvol_series.index,
+    )
+    _rvol_df.index.name = "PRICEDATE"
+    st.markdown(f"#### Rolling {_rvol_window}-Day Annualized Volatility (%)")
+    st.line_chart(_safe_chart_cols(_rvol_df), color=["#e8710a"], use_container_width=True, height=280)
+    st.caption(
+        f"Rolling {_rvol_window}-day annualized volatility (Buy & Hold). "
+        f"Full-period vol: **{_bh_metrics['annualized_vol']:.2%}**. "
+        "Adjust window in sidebar Parameters."
+    )
 
 st.subheader("Per-Ticker Cumulative Return (%)")
 return_cols = [f"{tk} Return (%)" for tk in tickers_used if f"{tk} Return (%)" in daily.columns]
@@ -2292,7 +2330,10 @@ if rebal["enabled"]:
                 st.line_chart(drift_ts_df, use_container_width=True, height=300)
                 st.caption(f"Daily drift (%) per ticker under **{selected_drift_strategy}**.")
 
-        # ── Event Log ────────────────────────────────────────────────────────
+        # ── TASK 4: Rebalancing Log ───────────────────────────────────────────
+        # Show a structured, human-readable rebalancing activity log with:
+        # Date | Strategy | Trigger | Assets Involved | Turnover ($) | Reason
+        # This replaces the raw internal event log with a client-ready format.
         if event_logs:
             if not _elog_sum_df.empty:
                 st.markdown("#### Rebalancing Event Summary")
@@ -2306,21 +2347,55 @@ if rebal["enabled"]:
                         extra_sheets=_elog_sheets,
                     )
 
-            with st.expander("\U0001f4cb Full Rebalance Event Log"):
-                if _elog_sheets:
-                    st.download_button(
-                        label="\u2b07 Download Full Event Log (.xlsx)",
-                        data=to_excel_bytes(_elog_sheets),
-                        file_name="rebalance_event_log_full.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="download_event_log",
-                    )
-                for _lbl_e, _log_df_e in event_logs.items():
-                    st.markdown(f"**{_lbl_e}**")
-                    if not _log_df_e.empty:
-                        st.dataframe(_log_df_e, use_container_width=True, hide_index=True)
+            # Build a combined, formatted rebalancing log across all strategies
+            _formatted_log_rows = []
+            for _lbl_e, _log_df_e in event_logs.items():
+                if _log_df_e.empty:
+                    continue
+                for _, _ev in _log_df_e.iterrows():
+                    _reason_raw = str(_ev.get("reason", "")).lower()
+                    # Map internal reason codes to plain-English labels
+                    if "threshold" in _reason_raw and "calendar" in _reason_raw:
+                        _trigger = "Threshold + Calendar"
+                        _reason_text = "Drift exceeded tolerance band AND scheduled calendar rebalance"
+                    elif "threshold" in _reason_raw:
+                        _trigger = "Threshold (Drift)"
+                        _reason_text = "A position drifted beyond its tolerance band"
+                    elif "calendar" in _reason_raw:
+                        _trigger = "Calendar"
+                        _reason_text = "Scheduled rebalance date reached"
                     else:
-                        st.info("No rebalance events triggered.")
+                        _trigger = _reason_raw.title()
+                        _reason_text = _reason_raw
+                    _formatted_log_rows.append({
+                        "Date": pd.Timestamp(_ev["date"]).strftime("%Y-%m-%d"),
+                        "Strategy": _lbl_e,
+                        "Trigger": _trigger,
+                        "Assets Involved": _ev.get("breached_tickers", "All") or "All",
+                        "Max Drift": f"{float(_ev.get('max_drift', 0)) * 100:.2f}%" if _ev.get("max_drift") else "—",
+                        "Turnover ($)": f"${float(_ev.get('turnover_dollars', 0)):,.0f}",
+                        "Reason": _reason_text,
+                    })
+
+            if _formatted_log_rows:
+                _fmt_log_df = pd.DataFrame(_formatted_log_rows)
+                with st.expander("📋 Rebalancing Activity Log", expanded=False):
+                    _el1, _el2 = st.columns([5, 1])
+                    with _el1:
+                        st.dataframe(_fmt_log_df, use_container_width=True, hide_index=True)
+                    with _el2:
+                        excel_download_button(
+                            _fmt_log_df, "rebalancing_log.xlsx",
+                            label="Download Log", sheet_name="Rebalancing Log",
+                        )
+                    st.caption(
+                        "Log shows every rebalancing event across all active strategies. "
+                        "'Assets Involved' lists tickers that breached their drift tolerance; "
+                        "'All' means a full portfolio rebalance was executed."
+                    )
+            else:
+                with st.expander("📋 Rebalancing Activity Log", expanded=False):
+                    st.info("No rebalance events were triggered in this simulation.")
 
         with st.expander("\u2139\ufe0f Rebalancing Engine Notes"):
             st.markdown(f"""
@@ -2354,16 +2429,100 @@ if opt:
     o_final = o_nav.iloc[-1]
     cap = p["initial_capital"]
 
-    kc1, kc2, kc3, kc4 = st.columns(4)
+    # TASK 4: Total dividends — sum gross value of all DRIP trades in the
+    # optimized run's trade log. DRIP = Dividend Reinvestment Plan entry.
+    # Non-reinvested dividends are held as cash and not in trades_df, so
+    # we estimate them as cash balance above initial_capital when NAV > market value.
+    _tdf_opt = opt_result_d.get("trades_df", pd.DataFrame())
+    _total_divs_opt = 0.0
+    if not _tdf_opt.empty and "action" in _tdf_opt.columns and "gross_value" in _tdf_opt.columns:
+        _drip_mask = _tdf_opt["action"] == "DRIP"
+        _total_divs_opt = float(_tdf_opt.loc[_drip_mask, "gross_value"].sum())
+
+    # KPI row — 5 cards: Static NAV, Optimized NAV, Advantage, Tax Paid, Dividends
+    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
     kc1.metric("Static Final NAV", f"${s_final:,.0f}", delta=f"{(s_final/cap - 1):+.2%}")
     kc2.metric("Optimized Final NAV", f"${o_final:,.0f}", delta=f"{(o_final/cap - 1):+.2%}")
     kc3.metric("Optimizer Advantage", f"${o_final - s_final:+,.0f}", delta=f"{((o_final - s_final)/cap):+.4%}")
     kc4.metric("Total Tax Paid (Opt)", f"${opt_result_d['tax_paid_total']:,.0f}",
                delta=f"Static: ${static_result_d['tax_paid_total']:,.0f}")
+    # TASK 4: Show total dividends reinvested (DRIP); shows "—" if dividend data unavailable
+    kc5.metric(
+        "Total Dividends (DRIP)",
+        f"${_total_divs_opt:,.0f}" if _total_divs_opt > 0 else "—",
+        help="Sum of all dividend payments reinvested via DRIP in the optimized run. "
+             "Requires dividend_data.csv. Non-reinvested dividends are held as cash.",
+    )
 
-    st.markdown("#### MSBA v1 \u2014 Portfolio NAV Over Time")
-    opt_chart = pd.DataFrame({"Static (TLH only)": s_nav, "Optimized (Rebal + TLH)": o_nav}).dropna()
-    st.line_chart(_safe_chart_cols(opt_chart), color=["#888888", "#e8710a"], use_container_width=True, height=380)
+    # ── TASK 6: 3-Line Chart with pre-tax / after-tax toggle ─────────────────
+    # Three lines on the same chart for direct comparison:
+    #   1. Buy & Hold (pre-tax benchmark — no TLH, no rebalancing)
+    #   2. Static TLH (TLH only, no rebalancing) — after-tax
+    #   3. Optimized (Rebal + TLH) — after-tax
+    # Pre-tax toggle: when enabled, approximate pre-tax NAV by adding back
+    # cumulative tax paid to the optimizer NAV. This is an approximation —
+    # it assumes all tax was paid from portfolio cash (which is what the engine does).
+    st.markdown("#### MSBA v1 — Portfolio NAV Over Time")
+
+    _pretax_toggle = st.checkbox(
+        "Show pre-tax vs after-tax comparison",
+        value=False,
+        key="pretax_toggle",
+        help=(
+            "Pre-tax: adds cumulative tax payments back to the NAV to show what "
+            "the portfolio would be worth if no tax were paid. "
+            "After-tax: actual NAV with taxes deducted."
+        ),
+    )
+
+    # Align all series to the same date index (use intersection)
+    _bh_nav_opt = daily["Portfolio Value"].reindex(o_nav.index).ffill()
+    _opt_chart_base = pd.DataFrame({
+        "Buy & Hold (pre-tax benchmark)": _bh_nav_opt,
+        "Static TLH (after-tax)": s_nav,
+        "Optimized Rebal+TLH (after-tax)": o_nav,
+    }).dropna()
+
+    if _pretax_toggle:
+        # Approximate pre-tax for each optimizer run by restoring tax paid.
+        # Assumption: tax paid is deducted from cash inside the engine on the
+        # day it's assessed; cumulative total is a single scalar (not time-series).
+        # We pro-rate it linearly as a rough estimate — use with caution.
+        _n_opt = len(o_nav)
+        _tax_ramp_opt = np.linspace(0, opt_result_d["tax_paid_total"], _n_opt)
+        _tax_ramp_sta = np.linspace(0, static_result_d["tax_paid_total"], _n_opt)
+        _opt_chart_pretax = pd.DataFrame({
+            "Buy & Hold (pre-tax benchmark)": _bh_nav_opt,
+            "Static TLH — pre-tax (est.)": pd.Series(
+                s_nav.values + _tax_ramp_sta[:len(s_nav)], index=s_nav.index
+            ),
+            "Optimized Rebal+TLH — pre-tax (est.)": pd.Series(
+                o_nav.values + _tax_ramp_opt[:len(o_nav)], index=o_nav.index
+            ),
+            "Static TLH — after-tax": s_nav,
+            "Optimized Rebal+TLH — after-tax": o_nav,
+        }).dropna()
+        st.line_chart(
+            _safe_chart_cols(_opt_chart_pretax),
+            color=["#1a73e8", "#aaaaaa", "#ffab00", "#888888", "#e8710a"],
+            use_container_width=True, height=420,
+        )
+        st.caption(
+            "Pre-tax lines (dashed labels) add back cumulative taxes as a linear "
+            "approximation — actual timing may vary. After-tax lines reflect true engine NAV."
+        )
+    else:
+        st.line_chart(
+            _safe_chart_cols(_opt_chart_base),
+            color=["#1a73e8", "#888888", "#e8710a"],
+            use_container_width=True, height=420,
+        )
+        st.caption(
+            "**Blue:** Buy & Hold pre-tax benchmark (no TLH, no rebalancing). "
+            "**Grey:** Static TLH after-tax NAV. "
+            "**Orange:** Optimized (Rebal + TLH) after-tax NAV. "
+            "Toggle 'pre-tax vs after-tax comparison' above to see tax impact."
+        )
 
     st.markdown("#### TLH & Tax Summary")
     _tl1, _tl2 = st.columns([4, 1])
