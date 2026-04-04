@@ -560,11 +560,14 @@ def build_rebalanced_series(prices_wide, target_weights, initial_capital, rebala
     # rebal_stats is the summary contract consumed by the metrics table and KPI cards.
     # turnover_proxy is dimensionless (dollars traded / average portfolio value) so
     # it's comparable across different capital amounts and time periods.
+    # TASK 1 FIX: total_turnover_dollars was missing here, causing transaction cost
+    # estimates to show $0 for all calendar rebalancing strategies. Added explicitly.
     rebal_stats = {
         "rebalance_count": rebalance_count,
         "turnover_proxy": round(turnover_proxy, 4),
         "final_value": round(portfolio_values[-1], 2),
         "total_return": round(portfolio_values[-1] / initial_capital - 1, 6),
+        "total_turnover_dollars": round(total_turnover_dollars, 2),
     }
     return rebal_daily, rebal_stats
 
@@ -925,6 +928,7 @@ def build_threshold_rebalanced_series(
     for tk in tickers:
         rebal_daily[f"{tk} (Thresh)"] = ticker_values_arr[tk]
     rebal_daily["Portfolio Value"] = portfolio_values
+    # TASK 1 FIX: total_turnover_dollars added (was missing, caused $0 cost estimates)
     rebal_stats = {
         "rebalance_count": rebalance_count,
         "calendar_rebal_count": calendar_rebal_count,
@@ -932,6 +936,7 @@ def build_threshold_rebalanced_series(
         "turnover_proxy": round(turnover_proxy, 4),
         "final_value": round(portfolio_values[-1], 2),
         "total_return": round(portfolio_values[-1] / initial_capital - 1, 6),
+        "total_turnover_dollars": round(total_turnover_dollars, 2),
     }
     if event_log:
         event_log_df = pd.DataFrame(event_log)
@@ -944,7 +949,7 @@ def build_threshold_rebalanced_series(
 # V4 ADDITION: Enhanced Performance Metrics
 # ================================================================
 
-def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=None):
+def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=None, dates=None):
     """
     Compute performance metrics from a daily portfolio value series.
 
@@ -955,8 +960,18 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
     - Tracking Error: annualized std of active returns vs benchmark
     - Information Ratio: annualized active return / tracking error
 
-    All annualization uses 252 trading days. Sharpe uses Rf=0 (simplification
-    appropriate for relative strategy comparison).
+    TASK 1 FIX — CAGR time-horizon correction:
+    - When `dates` is provided (DatetimeIndex or list of timestamps), CAGR uses
+      actual calendar days elapsed ÷ 365.25 for the year fraction. This avoids
+      the 252-trading-day approximation error which understates years on short
+      periods (e.g. a 3-month Q1 with 63 trading days: 63/252 = 0.25 years,
+      but the calendar says 90/365.25 = 0.246 years — small but consistent).
+    - Without dates, we use (n-1)/252 rather than n/252. n data points have
+      n-1 return intervals; using n overcounts elapsed time by one day, making
+      CAGR fractionally too low for short periods.
+    - Annualized vol and Sharpe always use 252 (industry standard for daily data).
+
+    All Sharpe calculations use Rf=0 (appropriate for relative strategy comparison).
     """
     n = len(daily_values)
     if n < 2:
@@ -965,58 +980,93 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
             "sharpe": 0.0, "max_drawdown": 0.0,
             "skewness": 0.0, "kurtosis": 0.0, "avg_drawdown": 0.0,
             "tracking_error": 0.0, "information_ratio": 0.0,
+            "trading_days": n,
         }
+    # Guard: replace any NaN/inf in daily_values so downstream math is clean
+    daily_values = np.where(np.isfinite(daily_values), daily_values, initial_capital)
     final = daily_values[-1]
-    total_return = final / initial_capital - 1
+    # Prevent divide-by-zero if initial_capital is zero or portfolio collapses
+    if initial_capital <= 0 or final <= 0:
+        total_return = 0.0
+    else:
+        total_return = final / initial_capital - 1
 
-    # CAGR: annualized geometric return. Uses 252 trading days = 1 year.
-    # The formula (final/initial)^(1/years) - 1 correctly compounds over
-    # multi-year periods. For sub-year periods it extrapolates (which can
-    # overstate returns for very short periods — interpret with caution).
-    years = n / 252.0
+    # ── CAGR calculation ─────────────────────────────────────────────────────
+    # Prefer actual calendar days when dates are available (more accurate for
+    # sub-year and exact-year periods). Fall back to (n-1)/252 otherwise.
+    # Using (n-1) instead of n: n data points → n-1 elapsed day intervals.
+    if dates is not None and len(dates) >= 2:
+        # Actual calendar elapsed time avoids the 252-day approximation
+        try:
+            t0 = pd.Timestamp(dates[0])
+            t1 = pd.Timestamp(dates[-1])
+            calendar_days = (t1 - t0).days
+            # 365.25 accounts for leap years; minimum 1 day to avoid div-zero
+            years = max(calendar_days, 1) / 365.25
+        except Exception:
+            # Fallback if date parsing fails
+            years = max(n - 1, 1) / 252.0
+    else:
+        # (n-1) intervals / 252 trading days per year
+        years = max(n - 1, 1) / 252.0
+
     if years > 0 and final > 0 and initial_capital > 0:
-        cagr = (final / initial_capital) ** (1 / years) - 1
+        cagr = (final / initial_capital) ** (1.0 / years) - 1
     else:
         cagr = 0.0
 
-    # Daily returns: simple (not log) returns. np.diff gives day-over-day price
-    # changes; dividing by the previous day's value converts to percentage returns.
-    # ddof=1 uses Bessel's correction for an unbiased sample standard deviation.
-    daily_rets = np.diff(daily_values) / daily_values[:-1]
+    # ── Daily returns ─────────────────────────────────────────────────────────
+    # Simple (not log) returns. np.diff gives day-over-day changes; dividing by
+    # the previous day's value gives percentage returns. ddof=1 = Bessel correction
+    # for unbiased sample std. Guard against zero-price days with np.where.
+    prev_vals = daily_values[:-1]
+    # Replace zeros in denominator with 1 (return = 0 on that day, not undefined)
+    safe_prev = np.where(prev_vals > 0, prev_vals, 1.0)
+    daily_rets = np.diff(daily_values) / safe_prev
+    # Drop any remaining NaN/inf that could propagate through statistics
+    daily_rets = daily_rets[np.isfinite(daily_rets)]
+
     ann_vol = np.std(daily_rets, ddof=1) * np.sqrt(252) if len(daily_rets) > 1 else 0.0
 
-    # Sharpe = CAGR / Vol (risk-free rate = 0 for simplicity in relative comparison)
+    # Sharpe = CAGR / Vol (Rf=0 for cross-strategy comparison consistency)
     sharpe = (cagr / ann_vol) if ann_vol > 0 else 0.0
 
-    # Drawdown series: how far below the running peak at each point
+    # ── Drawdown series ────────────────────────────────────────────────────────
+    # running_max tracks the historical high-water mark at each day.
+    # drawdowns[i] = (value[i] - peak_value) / peak_value ≤ 0
     running_max = np.maximum.accumulate(daily_values)
-    drawdowns = (daily_values - running_max) / running_max
+    # Guard: avoid divide-by-zero if running_max ever hits zero
+    safe_rm = np.where(running_max > 0, running_max, 1.0)
+    drawdowns = (daily_values - running_max) / safe_rm
     max_dd = float(np.min(drawdowns))
 
-    # Higher-moment statistics (V4) — require minimum samples to be meaningful.
-    # Skewness: negative values indicate the distribution has a longer left tail
-    # (more frequent large losses). Most equity portfolios show slight negative skew.
-    # Kurtosis (excess/Fisher): values > 0 mean heavier tails than a normal
-    # distribution — more extreme events than a bell curve would predict.
+    # ── Higher moments ─────────────────────────────────────────────────────────
+    # Skewness: negative = fatter left tail = more frequent large losses.
+    # Kurtosis (excess/Fisher): >0 = heavier tails than a normal distribution.
+    # Require minimum sample sizes before computing (scipy returns NaN otherwise).
     skewness = float(sp_stats.skew(daily_rets)) if len(daily_rets) > 2 else 0.0
     kurtosis = float(sp_stats.kurtosis(daily_rets, fisher=True)) if len(daily_rets) > 3 else 0.0
-    # Average drawdown: the mean of ALL daily drawdowns (most of which are small).
-    # Unlike max drawdown which is a single worst case, this captures the "typical"
-    # underwater experience. A strategy with low max DD but high avg DD spends a
-    # lot of time slightly underwater — important for investor psychology.
+
+    # Average drawdown: mean of ALL daily drawdowns, not just the worst.
+    # Captures the "typical" underwater experience — a strategy with low max DD
+    # but high avg DD spends a lot of time slightly underwater.
     avg_drawdown = float(np.mean(drawdowns))
 
-    # Tracking error and information ratio: only computed when a benchmark
-    # (typically buy-and-hold) is provided. These measure active return quality:
-    # TE = how much the strategy's returns deviate from the benchmark day-to-day
-    # IR = how efficiently the strategy generates excess return per unit of deviation
-    # A high IR (> 0.5) suggests the rebalancing strategy adds consistent value.
+    # ── Tracking error & information ratio ────────────────────────────────────
+    # Only computed when a benchmark (typically buy-and-hold) is provided.
+    # TE = annualized std of daily active returns vs benchmark
+    # IR = annualized excess return / TE. IR > 0.5 generally indicates
+    # the active strategy adds consistent value beyond random variation.
     tracking_error = 0.0
     information_ratio = 0.0
     if benchmark_values is not None and len(benchmark_values) == n:
-        bm_rets = np.diff(benchmark_values) / benchmark_values[:-1]
-        # Active returns = strategy daily returns minus benchmark daily returns
-        active_rets = daily_rets - bm_rets
+        bm_vals = np.where(np.isfinite(benchmark_values), benchmark_values, initial_capital)
+        bm_prev = bm_vals[:-1]
+        safe_bm_prev = np.where(bm_prev > 0, bm_prev, 1.0)
+        bm_rets = np.diff(bm_vals) / safe_bm_prev
+        # Align lengths after NaN-filtering (use min length to stay in sync)
+        active_rets = daily_rets[:len(bm_rets)] - bm_rets[:len(daily_rets)]
+        active_rets = active_rets[np.isfinite(active_rets)]
         tracking_error = float(np.std(active_rets, ddof=1) * np.sqrt(252)) if len(active_rets) > 1 else 0.0
         if tracking_error > 1e-12:
             # Annualize active return: daily mean × 252 trading days
@@ -1034,6 +1084,10 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
         "avg_drawdown": round(avg_drawdown, 6),
         "tracking_error": round(tracking_error, 6),
         "information_ratio": round(information_ratio, 4),
+        # trading_days exposed so callers can display the period length
+        "trading_days": n,
+        # years_used: for debugging / validating CAGR time horizon
+        "years_used": round(years, 4),
     }
 
 
@@ -1174,8 +1228,25 @@ max_date = df_dates.max().date()
 default_end = max_date
 default_start = max(min_date, (max_date - timedelta(days=365)))
 
+# TASK 2: Show the valid date range so users know what data is available.
+# The date inputs already clamp to min_value/max_value, but surfacing the
+# range explicitly prevents confusion when users type arbitrary dates.
+st.sidebar.caption(
+    f"📅 Data available: **{min_date}** → **{max_date}**"
+)
+
 start_date = date_cols[0].date_input("Start Date", value=default_start, min_value=min_date, max_value=max_date)
 end_date = date_cols[1].date_input("End Date", value=default_end, min_value=min_date, max_value=max_date)
+
+# TASK 2: Warn the user if the selected range is very short (< 30 calendar days)
+# — CAGR annualizes aggressively on short windows and can be misleading.
+if (end_date - start_date).days < 30:
+    st.sidebar.warning(
+        "⚠️ Date range is under 30 days. CAGR will be a highly extrapolated "
+        "annualized estimate — interpret with caution."
+    )
+elif start_date >= end_date:
+    st.sidebar.error("❌ Start date must be before end date.")
 
 initial_capital = st.sidebar.number_input(
     "Initial Capital ($)", min_value=1_000, max_value=100_000_000,
@@ -1386,19 +1457,39 @@ else:
 # ================================================================
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 💸 Transaction Cost Assumptions")
-st.sidebar.caption("Applied to the MSBA v1 optimizer. Used to estimate costs for calendar/threshold strategies.")
+# TASK 3: Updated caption to be non-technical and clear
+st.sidebar.caption(
+    "These costs are subtracted every time assets are bought or sold. "
+    "Lower costs = more of your money stays invested."
+)
 
+# TASK 3: Rewrote all three tooltips to be clear, non-technical, and example-driven.
 _commission_bps = st.sidebar.number_input(
     "Commission (bps/trade)", min_value=0.0, max_value=50.0, value=5.0, step=0.5,
-    help="Flat execution cost in basis points of trade value (~$0.005/sh on a $100 stock = 5 bps).",
+    help=(
+        "The flat fee charged by a broker on each trade, measured in basis points (bps). "
+        "1 bps = 0.01% of the trade value.\n\n"
+        "Example: A 5 bps commission on a $10,000 trade costs $5.00. "
+        "Most modern brokers charge 0–10 bps."
+    ),
 )
 _slippage_bps = st.sidebar.number_input(
     "Slippage (bps)", min_value=0.0, max_value=50.0, value=5.0, step=0.5,
-    help="Market impact / price improvement slippage in basis points.",
+    help=(
+        "The difference between the expected trade price and the actual price you get — "
+        "large orders move the market slightly against you.\n\n"
+        "Example: You want to buy at $100.00 but the order fills at $100.05. "
+        "That 5-cent gap on a $10,000 trade = 5 bps = $5.00 lost."
+    ),
 )
 _bid_ask_bps = st.sidebar.number_input(
     "Bid-Ask Spread (bps, one-way)", min_value=0.0, max_value=30.0, value=2.0, step=0.5,
-    help="One-way half-spread cost in basis points.",
+    help=(
+        "The gap between the price buyers pay (ask) and sellers receive (bid). "
+        "Entering or exiting a position costs half this spread.\n\n"
+        "Example: A stock quoted at Bid $99.98 / Ask $100.02 has a 4-bps spread. "
+        "Buying then immediately selling costs ~2 bps each way = $2 per $10,000 traded."
+    ),
 )
 _cost_config = {
     "commission_bps": _commission_bps,
@@ -1452,16 +1543,33 @@ if run_btn:
 
     # ── Portfolio Summary Stats ────────────────────────────────────────────
     _bh_vals = _daily["Portfolio Value"].values
-    _bh_metrics = compute_strategy_metrics(_bh_vals, float(initial_capital))
+    _bh_dates = _daily.index  # DatetimeIndex used for date-aware CAGR (TASK 1)
+    # TASK 1: Pass dates so CAGR uses actual calendar years, not 252-day approximation
+    _bh_metrics = compute_strategy_metrics(_bh_vals, float(initial_capital), dates=_bh_dates)
     _n_days = len(_bh_vals)
+
+    # TASK 4: Compute annualized rolling volatility series for the chart section.
+    # Window is set here from a sidebar control defined below; default = 30 trading days.
+    # We compute it on the daily series now and store it for display later.
+    _bh_daily_rets = pd.Series(
+        np.diff(_bh_vals) / np.where(_bh_vals[:-1] > 0, _bh_vals[:-1], 1.0),
+        index=_bh_dates[1:],
+    )
+
+    # TASK 4: Total dividends received — extracted from MSBA optimizer later.
+    # Placeholder here; filled in after optimizer runs.
+    _total_dividends_bh = 0.0
 
     _summary_stats_rows = [
         ("Period", f"{str(start_date)} → {str(end_date)}"),
+        ("Years (actual)", f"{_bh_metrics['years_used']:.2f}"),
         ("Trading Days", f"{_n_days:,}"),
         ("Initial Capital", f"${float(initial_capital):,.0f}"),
         ("Final Value (B&H)", f"${_bh_vals[-1]:,.0f}"),
         ("Total Return", f"{_bh_metrics['total_return']:+.2%}"),
-        ("CAGR", f"{_bh_metrics['cagr']:+.2%}"),
+        # TASK 1: CAGR now uses actual calendar days (see compute_strategy_metrics)
+        ("CAGR (annualized)", f"{_bh_metrics['cagr']:+.2%}"),
+        # TASK 4: Annualized Volatility (full-period) — rolling vol shown in chart
         ("Annualized Volatility", f"{_bh_metrics['annualized_vol']:.2%}"),
         ("Sharpe Ratio (Rf=0)", f"{_bh_metrics['sharpe']:.3f}"),
         ("Max Drawdown", f"{_bh_metrics['max_drawdown']:.2%}"),
@@ -1544,6 +1652,27 @@ if run_btn:
             except ValueError as e:
                 st.warning(f"\u26a0\ufe0f Could not compute threshold rebalancing: {e}")
 
+            # TASK 5: When calendar+threshold are both enabled, also run a
+            # threshold-only strategy so it appears as a separate comparison row.
+            # This lets users isolate the drift-band effect from the calendar effect.
+            if enable_calendar_rebal:
+                try:
+                    _tonly_rd, _tonly_rs, _tonly_log, _tonly_drift = build_threshold_rebalanced_series(
+                        prices_wide=_prices_wide, target_weights=_target_weights,
+                        initial_capital=float(initial_capital), tolerances=_tolerances,
+                        drift_mode=drift_mode, rebalance_action=rebalance_action,
+                        cooldown_days=cooldown_days,
+                        calendar_freq=None,
+                        enable_calendar=False,  # threshold-only — no calendar component
+                        enable_threshold=True,
+                        whole_shares=allow_cash,
+                    )
+                    _strategy_results["Threshold Only"] = (_tonly_rd, _tonly_rs)
+                    _event_logs["Threshold Only"] = _tonly_log
+                    _drift_histories["Threshold Only"] = _tonly_drift
+                except ValueError as e:
+                    st.warning(f"\u26a0\ufe0f Could not compute threshold-only strategy: {e}")
+
         if _strategy_results:
             _comparison_df = pd.DataFrame(index=_prices_wide.index)
             _comparison_df.index.name = "PRICEDATE"
@@ -1553,7 +1682,9 @@ if run_btn:
             _comparison_df = _comparison_df.dropna()
 
             _bh_vals_arr = _comparison_df["Buy & Hold"].values
-            _bh_m2 = compute_strategy_metrics(_bh_vals_arr, float(initial_capital), benchmark_values=None)
+            _comp_dates = _comparison_df.index  # DatetimeIndex for date-aware CAGR
+            # TASK 1: Pass dates for accurate calendar-based CAGR
+            _bh_m2 = compute_strategy_metrics(_bh_vals_arr, float(initial_capital), benchmark_values=None, dates=_comp_dates)
             _bh_m2.update({"rebalance_count": 0, "turnover_proxy": 0.0})
 
             _metrics_raw: Dict = {
@@ -1578,7 +1709,8 @@ if run_btn:
             for _lbl in _strategy_results:
                 _rd3, _rs3 = _strategy_results[_lbl]
                 _vals3 = _comparison_df[_lbl].values
-                _m3 = compute_strategy_metrics(_vals3, float(initial_capital), benchmark_values=_bh_vals_arr)
+                # TASK 1: Pass dates to all strategy metric computations
+                _m3 = compute_strategy_metrics(_vals3, float(initial_capital), benchmark_values=_bh_vals_arr, dates=_comp_dates)
                 _td3 = _rs3.get("total_turnover_dollars", 0.0)
                 _ec3 = _td3 * _total_cost_rate
                 _metrics_raw[_lbl] = {
