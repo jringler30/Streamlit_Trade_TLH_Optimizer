@@ -2170,7 +2170,55 @@ if rebal["enabled"]:
         _bid_ask_bps_d = p["bid_ask_bps"]
         _total_cost_rate_d = p["total_cost_rate"]
 
-        # ── Performance Metrics Table ──────────────────────────────────────
+        # ── 1. KPI Cards (top of section for at-a-glance summary) ───────────
+        _bh_final = rebal["bh_vals_arr"][-1]
+        _rb_final = primary_stats["final_value"]
+        _rb_return = primary_stats["total_return"]
+        _bh_ret = rebal["bh_m2"]["total_return"]
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric(f"{primary_label} Final", f"${_rb_final:,.0f}", delta=f"{_rb_return:+.2%}")
+        rc2.metric("Buy-and-Hold Final", f"${_bh_final:,.0f}", delta=f"{_bh_ret:+.2%}")
+        rc3.metric("Strategy Advantage", f"${_rb_final - _bh_final:+,.0f}", delta=f"{(_rb_return - _bh_ret):+.4%}")
+        rc4.metric("Rebalance Events", f"{primary_stats['rebalance_count']:,}", delta=f"Turnover: {primary_stats['turnover_proxy']:.2f}×")
+
+        # ── 2. Portfolio Value Over Time ─────────────────────────────────────
+        st.markdown("#### Portfolio Value Over Time")
+        selected_strats = st.multiselect(
+            "Strategies to display",
+            options=_all_strat_labels,
+            default=_all_strat_labels,
+            key="value_chart_strats",
+        )
+        if selected_strats:
+            _chart_df = comparison_df[selected_strats]
+            _chart_colors = [_color_map.get(s, "#666666") for s in selected_strats]
+            st.line_chart(_safe_chart_cols(_chart_df), color=_chart_colors, use_container_width=True, height=400)
+        else:
+            st.info("Select at least one strategy to display.")
+
+        # ── 3. Drawdown Over Time (always shown — no toggle) ─────────────────
+        strategy_colors = [_color_map.get(c, "#666666") for c in comparison_df.columns]
+        st.markdown("#### Drawdown Over Time")
+        dd_chart_df = pd.DataFrame(index=comparison_df.index)
+        for _col in comparison_df.columns:
+            _vals_c = comparison_df[_col].values
+            _rm_c = np.maximum.accumulate(_vals_c)
+            safe_rm_c = np.where(_rm_c > 0, _rm_c, 1.0)
+            dd_chart_df[_col] = ((_vals_c - _rm_c) / safe_rm_c) * 100
+        st.area_chart(_safe_chart_cols(dd_chart_df), color=strategy_colors, use_container_width=True, height=280)
+        st.caption("Drawdown (%) = distance below each strategy's historical peak value.")
+
+        # ── 4. Strategy vs B&H dollar difference ────────────────────────────
+        if primary_label in comparison_df.columns:
+            diff_series = comparison_df[primary_label] - comparison_df["Buy & Hold"]
+            diff_chart = pd.DataFrame({f"{primary_label} vs B&H ($)": diff_series})
+            advantage_color = "#34a853" if diff_series.iloc[-1] >= 0 else "#ea4335"
+            st.area_chart(_safe_chart_cols(diff_chart), color=[advantage_color], use_container_width=True, height=180)
+            st.caption(f"Dollar advantage of **{primary_label}** over Buy & Hold over time.")
+
+        st.markdown("---")
+
+        # ── 5. Performance Metrics Table ─────────────────────────────────────
         st.markdown("#### Performance Metrics")
         _mc1, _mc2 = st.columns([5, 1])
         with _mc1:
@@ -2187,7 +2235,7 @@ if rebal["enabled"]:
             "IR = annualized active return ÷ TE (unitless)."
         )
 
-        # ── Strategy Ranking ────────────────────────────────────────────────
+        # ── 6. Strategy Ranking ──────────────────────────────────────────────
         st.markdown("#### Strategy Ranking")
         _rk1, _rk2 = st.columns([4, 1])
         with _rk1:
@@ -2199,7 +2247,7 @@ if rebal["enabled"]:
             )
         st.caption("Composite Score = sum of per-dimension ranks. **Lower score = better overall.** Ranks 1=best within each dimension.")
 
-        # ── Transaction Cost Breakdown ───────────────────────────────────────
+        # ── 7. Transaction Cost Breakdown ────────────────────────────────────
         st.markdown("#### Transaction Cost Breakdown")
         _cc1, _cc2 = st.columns([4, 1])
         with _cc1:
@@ -2210,7 +2258,7 @@ if rebal["enabled"]:
                 label="Transaction Costs", sheet_name="Costs",
             )
 
-        # ── Drawdown Summary ─────────────────────────────────────────────────
+        # ── 8. Drawdown Summary Table ────────────────────────────────────────
         st.markdown("#### Drawdown Summary")
         _ddc1, _ddc2 = st.columns([5, 1])
         with _ddc1:
@@ -2220,50 +2268,6 @@ if rebal["enabled"]:
                 _dd_df, "drawdown_summary.xlsx",
                 label="Drawdown Summary", sheet_name="Drawdowns",
             )
-
-        # ── KPI Cards ────────────────────────────────────────────────────────
-        _bh_final = rebal["bh_vals_arr"][-1]
-        _rb_final = primary_stats["final_value"]
-        _rb_return = primary_stats["total_return"]
-        _bh_ret = rebal["bh_m2"]["total_return"]
-        rc1, rc2, rc3, rc4 = st.columns(4)
-        rc1.metric(f"{primary_label} Final", f"${_rb_final:,.0f}", delta=f"{_rb_return:+.2%}")
-        rc2.metric("Buy-and-Hold Final", f"${_bh_final:,.0f}", delta=f"{_bh_ret:+.2%}")
-        rc3.metric("Strategy Advantage", f"${_rb_final - _bh_final:+,.0f}", delta=f"{(_rb_return - _bh_ret):+.4%}")
-        rc4.metric("Rebalance Events", f"{primary_stats['rebalance_count']:,}", delta=f"Turnover: {primary_stats['turnover_proxy']:.2f}")
-
-        # ── Portfolio Value Chart ────────────────────────────────────────────
-        st.markdown("#### Portfolio Value Over Time")
-        selected_strats = st.multiselect(
-            "Strategies to display",
-            options=_all_strat_labels,
-            default=_all_strat_labels,
-            key="value_chart_strats",
-        )
-        if selected_strats:
-            _chart_df = comparison_df[selected_strats]
-            _chart_colors = [_color_map.get(s, "#666666") for s in selected_strats]
-            st.line_chart(_safe_chart_cols(_chart_df), color=_chart_colors, use_container_width=True, height=420)
-        else:
-            st.info("Select at least one strategy to display.")
-
-        strategy_colors = [_color_map.get(c, "#666666") for c in comparison_df.columns]
-
-        show_drawdown = st.checkbox("Show Drawdown Chart", value=False)
-        if show_drawdown:
-            st.markdown("#### Drawdown Over Time")
-            dd_chart_df = pd.DataFrame(index=comparison_df.index)
-            for _col in comparison_df.columns:
-                _vals_c = comparison_df[_col].values
-                _rm_c = np.maximum.accumulate(_vals_c)
-                dd_chart_df[_col] = ((_vals_c - _rm_c) / _rm_c) * 100
-            st.area_chart(_safe_chart_cols(dd_chart_df), color=strategy_colors, use_container_width=True, height=300)
-
-        if primary_label in comparison_df.columns:
-            diff_series = comparison_df[primary_label] - comparison_df["Buy & Hold"]
-            diff_chart = pd.DataFrame({f"{primary_label} vs B&H ($)": diff_series})
-            advantage_color = "#34a853" if diff_series.iloc[-1] >= 0 else "#ea4335"
-            st.area_chart(_safe_chart_cols(diff_chart), color=[advantage_color], use_container_width=True, height=200)
 
         # ── Drift Diagnostics ────────────────────────────────────────────────
         if drift_histories:
@@ -2437,91 +2441,99 @@ if opt:
         _drip_mask = _tdf_opt["action"] == "DRIP"
         _total_divs_opt = float(_tdf_opt.loc[_drip_mask, "gross_value"].sum())
 
-    # KPI row — 5 cards: Static NAV, Optimized NAV, Advantage, Tax Paid, Dividends
+    # ── 1. KPI Cards ─────────────────────────────────────────────────────────
     kc1, kc2, kc3, kc4, kc5 = st.columns(5)
     kc1.metric("Static Final NAV", f"${s_final:,.0f}", delta=f"{(s_final/cap - 1):+.2%}")
     kc2.metric("Optimized Final NAV", f"${o_final:,.0f}", delta=f"{(o_final/cap - 1):+.2%}")
     kc3.metric("Optimizer Advantage", f"${o_final - s_final:+,.0f}", delta=f"{((o_final - s_final)/cap):+.4%}")
     kc4.metric("Total Tax Paid (Opt)", f"${opt_result_d['tax_paid_total']:,.0f}",
                delta=f"Static: ${static_result_d['tax_paid_total']:,.0f}")
-    # TASK 4: Show total dividends reinvested (DRIP); shows "—" if dividend data unavailable
     kc5.metric(
         "Total Dividends (DRIP)",
         f"${_total_divs_opt:,.0f}" if _total_divs_opt > 0 else "—",
-        help="Sum of all dividend payments reinvested via DRIP in the optimized run. "
-             "Requires dividend_data.csv. Non-reinvested dividends are held as cash.",
+        help="Sum of all dividend payments reinvested (DRIP) in the optimized run. "
+             "Requires dividend_data.csv.",
     )
 
-    # ── TASK 6: 3-Line Chart with pre-tax / after-tax toggle ─────────────────
-    # Three lines on the same chart for direct comparison:
-    #   1. Buy & Hold (pre-tax benchmark — no TLH, no rebalancing)
-    #   2. Static TLH (TLH only, no rebalancing) — after-tax
-    #   3. Optimized (Rebal + TLH) — after-tax
-    # Pre-tax toggle: when enabled, approximate pre-tax NAV by adding back
-    # cumulative tax paid to the optimizer NAV. This is an approximation —
-    # it assumes all tax was paid from portfolio cash (which is what the engine does).
-    st.markdown("#### MSBA v1 — Portfolio NAV Over Time")
-
-    _pretax_toggle = st.checkbox(
-        "Show pre-tax vs after-tax comparison",
-        value=False,
-        key="pretax_toggle",
-        help=(
-            "Pre-tax: adds cumulative tax payments back to the NAV to show what "
-            "the portfolio would be worth if no tax were paid. "
-            "After-tax: actual NAV with taxes deducted."
-        ),
-    )
-
-    # Align all series to the same date index (use intersection)
+    # ── 2. Portfolio NAV Over Time (3-line: B&H + Static TLH + Optimized) ───
+    # Blue = Buy & Hold (pre-tax benchmark), Grey = Static TLH, Orange = Optimized
+    st.markdown("#### Portfolio NAV Over Time")
     _bh_nav_opt = daily["Portfolio Value"].reindex(o_nav.index).ffill()
     _opt_chart_base = pd.DataFrame({
-        "Buy & Hold (pre-tax benchmark)": _bh_nav_opt,
+        "Buy & Hold (benchmark)": _bh_nav_opt,
         "Static TLH (after-tax)": s_nav,
         "Optimized Rebal+TLH (after-tax)": o_nav,
     }).dropna()
+    st.line_chart(
+        _safe_chart_cols(_opt_chart_base),
+        color=["#1a73e8", "#888888", "#e8710a"],
+        use_container_width=True, height=400,
+    )
+    st.caption(
+        "**Blue:** Buy & Hold (no TLH, no rebalancing). "
+        "**Grey:** Static TLH only (after-tax). "
+        "**Orange:** Optimized Rebal + TLH (after-tax)."
+    )
 
-    if _pretax_toggle:
-        # Approximate pre-tax for each optimizer run by restoring tax paid.
-        # Assumption: tax paid is deducted from cash inside the engine on the
-        # day it's assessed; cumulative total is a single scalar (not time-series).
-        # We pro-rate it linearly as a rough estimate — use with caution.
-        _n_opt = len(o_nav)
-        _tax_ramp_opt = np.linspace(0, opt_result_d["tax_paid_total"], _n_opt)
-        _tax_ramp_sta = np.linspace(0, static_result_d["tax_paid_total"], _n_opt)
-        _opt_chart_pretax = pd.DataFrame({
-            "Buy & Hold (pre-tax benchmark)": _bh_nav_opt,
-            "Static TLH — pre-tax (est.)": pd.Series(
-                s_nav.values + _tax_ramp_sta[:len(s_nav)], index=s_nav.index
-            ),
-            "Optimized Rebal+TLH — pre-tax (est.)": pd.Series(
-                o_nav.values + _tax_ramp_opt[:len(o_nav)], index=o_nav.index
-            ),
-            "Static TLH — after-tax": s_nav,
-            "Optimized Rebal+TLH — after-tax": o_nav,
-        }).dropna()
-        st.line_chart(
-            _safe_chart_cols(_opt_chart_pretax),
-            color=["#1a73e8", "#aaaaaa", "#ffab00", "#888888", "#e8710a"],
-            use_container_width=True, height=420,
-        )
-        st.caption(
-            "Pre-tax lines (dashed labels) add back cumulative taxes as a linear "
-            "approximation — actual timing may vary. After-tax lines reflect true engine NAV."
-        )
-    else:
-        st.line_chart(
-            _safe_chart_cols(_opt_chart_base),
-            color=["#1a73e8", "#888888", "#e8710a"],
-            use_container_width=True, height=420,
-        )
-        st.caption(
-            "**Blue:** Buy & Hold pre-tax benchmark (no TLH, no rebalancing). "
-            "**Grey:** Static TLH after-tax NAV. "
-            "**Orange:** Optimized (Rebal + TLH) after-tax NAV. "
-            "Toggle 'pre-tax vs after-tax comparison' above to see tax impact."
-        )
+    # ── 3. Drawdown Over Time ────────────────────────────────────────────────
+    st.markdown("#### Drawdown Over Time")
+    _opt_dd_df = pd.DataFrame(index=_opt_chart_base.index)
+    _opt_dd_colors = ["#1a73e8", "#888888", "#e8710a"]
+    for _col in _opt_chart_base.columns:
+        _v = _opt_chart_base[_col].values
+        _rm = np.maximum.accumulate(_v)
+        _safe_rm = np.where(_rm > 0, _rm, 1.0)
+        _opt_dd_df[_col] = ((_v - _rm) / _safe_rm) * 100
+    st.area_chart(_safe_chart_cols(_opt_dd_df), color=_opt_dd_colors, use_container_width=True, height=280)
+    st.caption("Drawdown (%) = distance below each portfolio's historical peak value.")
 
+    st.markdown("---")
+
+    # ── 4. Performance Metrics Table ─────────────────────────────────────────
+    # Compute the same metrics as the rebalancing section for each scenario
+    # so both sections show identical columns in identical order.
+    st.markdown("#### Performance Metrics")
+    _opt_metrics_rows = []
+    for _lbl_m, _nav_m in [
+        ("Buy & Hold", _bh_nav_opt),
+        ("Static TLH", s_nav),
+        ("Optimized Rebal+TLH", o_nav),
+    ]:
+        _nav_arr = _nav_m.dropna().values
+        _nav_dates = _nav_m.dropna().index
+        if len(_nav_arr) < 2:
+            continue
+        _bh_arr_bench = _bh_nav_opt.reindex(_nav_dates).ffill().values
+        _is_bh = _lbl_m == "Buy & Hold"
+        _m_opt = compute_strategy_metrics(
+            _nav_arr, cap,
+            benchmark_values=None if _is_bh else _bh_arr_bench,
+            dates=_nav_dates,
+        )
+        _opt_metrics_rows.append({
+            "Scenario": _lbl_m,
+            "Final Value ($)": f"${_nav_arr[-1]:,.0f}",
+            "Total Return": f"{_m_opt['total_return']:+.2%}",
+            "CAGR": f"{_m_opt['cagr']:+.2%}",
+            "Ann. Vol": f"{_m_opt['annualized_vol']:.2%}",
+            "Sharpe": f"{_m_opt['sharpe']:.3f}",
+            "Max DD": f"{_m_opt['max_drawdown']:.2%}",
+            "Avg DD": f"{_m_opt['avg_drawdown']:.2%}",
+            "Skew": f"{_m_opt['skewness']:.3f}",
+            "Kurt": f"{_m_opt['kurtosis']:.3f}",
+            "TE (ann.)": "—" if _is_bh else f"{_m_opt['tracking_error']:.2%}",
+            "IR": "—" if _is_bh else f"{_m_opt['information_ratio']:.3f}",
+        })
+    _opt_metrics_df = pd.DataFrame(_opt_metrics_rows)
+    _om1, _om2 = st.columns([5, 1])
+    with _om1:
+        st.dataframe(_opt_metrics_df, use_container_width=True, hide_index=True)
+    with _om2:
+        excel_download_button(_opt_metrics_df, "optimizer_metrics.xlsx",
+                              label="Optimizer Metrics", sheet_name="Metrics")
+    st.caption("Sharpe uses Rf=0. TE and IR measured vs Buy & Hold benchmark.")
+
+    # ── 5. TLH & Tax Summary ─────────────────────────────────────────────────
     st.markdown("#### TLH & Tax Summary")
     _tl1, _tl2 = st.columns([4, 1])
     with _tl1:
@@ -2531,19 +2543,10 @@ if opt:
             _tlh_df_d, "tlh_tax_summary.xlsx",
             label="TLH & Tax Summary", sheet_name="TLH Summary",
         )
-    st.caption("Net Benefit = Est. Tax Savings \u2212 Tax Paid \u2212 Execution Costs. Positive = TLH added value.")
+    st.caption("Net Benefit = Est. Tax Savings − Tax Paid − Execution Costs. Positive = TLH added value.")
 
-    # Tax Alpha time-series chart
-    _alpha2_s = opt_result_d.get("tax_alpha_2_series")
-    if _alpha2_s is not None:
-        st.markdown("#### Tax Alpha Over Time (Optimized Run)")
-        _alpha_chart_df = pd.DataFrame(index=opt_result_d["nav_series"].index)
-        _alpha_chart_df["Alpha 2 (TLH vs no-TLH baseline, $)"] = _alpha2_s.values
-        _alpha_chart_df.index.name = "Date"
-        st.line_chart(_alpha_chart_df)
-        st.caption("Alpha 2 — NAV difference between the TLH portfolio and an identical portfolio with no harvesting.")
-
-    with st.expander("\U0001f4cb Optimized Portfolio \u2014 Realized Gains"):
+    # ── 6. Detailed Logs (expanders) ─────────────────────────────────────────
+    with st.expander("📋 Optimized Portfolio — Realized Gains"):
         _rdf_d = opt_result_d["realized_df"]
         if not _rdf_d.empty:
             _rg1, _rg2 = st.columns([5, 1])
@@ -2554,7 +2557,7 @@ if opt:
         else:
             st.info("No realized gains/losses.")
 
-    with st.expander("\U0001f4cb Optimized Portfolio \u2014 Trade Log"):
+    with st.expander("📋 Optimized Portfolio — Trade Log"):
         _tdf_d = opt_result_d["trades_df"]
         if not _tdf_d.empty:
             _tr1, _tr2 = st.columns([5, 1])
