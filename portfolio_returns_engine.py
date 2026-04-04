@@ -1558,18 +1558,14 @@ if run_btn:
     _bh_metrics = compute_strategy_metrics(_bh_vals, float(initial_capital), dates=_bh_dates)
     _n_days = len(_bh_vals)
 
-    # TASK 4: Compute annualized rolling volatility series for the chart section.
-    # Window is set here from a sidebar control defined below; default = 30 trading days.
-    # We compute it on the daily series now and store it for display later.
-    _bh_daily_rets = pd.Series(
-        np.diff(_bh_vals) / np.where(_bh_vals[:-1] > 0, _bh_vals[:-1], 1.0),
-        index=_bh_dates[1:],
-    )
+    # TASK 7: Removed unused _bh_daily_rets (rolling vol is computed live in the
+    # display section from _bh_vals, no need to pre-compute here).
+    # Removed unused _total_dividends_bh placeholder (dividends extracted from
+    # optimizer trades_df in the display section where the data is available).
 
-    # TASK 4: Total dividends received — extracted from MSBA optimizer later.
-    # Placeholder here; filled in after optimizer runs.
-    _total_dividends_bh = 0.0
-
+    # TASK 7: "CAGR" is inherently annualized — dropping "(annualized)" suffix to
+    # match the comparison table column header and avoid redundancy.
+    # Units are explicit throughout: % for rates, $ for dollar values.
     _summary_stats_rows = [
         ("Period", f"{str(start_date)} → {str(end_date)}"),
         ("Years (actual)", f"{_bh_metrics['years_used']:.2f}"),
@@ -1577,10 +1573,9 @@ if run_btn:
         ("Initial Capital", f"${float(initial_capital):,.0f}"),
         ("Final Value (B&H)", f"${_bh_vals[-1]:,.0f}"),
         ("Total Return", f"{_bh_metrics['total_return']:+.2%}"),
-        # TASK 1: CAGR now uses actual calendar days (see compute_strategy_metrics)
-        ("CAGR (annualized)", f"{_bh_metrics['cagr']:+.2%}"),
-        # TASK 4: Annualized Volatility (full-period) — rolling vol shown in chart
-        ("Annualized Volatility", f"{_bh_metrics['annualized_vol']:.2%}"),
+        ("CAGR", f"{_bh_metrics['cagr']:+.2%}"),
+        # Ann. Vol: full-period; rolling vol shown as toggle chart below
+        ("Ann. Volatility", f"{_bh_metrics['annualized_vol']:.2%}"),
         ("Sharpe Ratio (Rf=0)", f"{_bh_metrics['sharpe']:.3f}"),
         ("Max Drawdown", f"{_bh_metrics['max_drawdown']:.2%}"),
         ("Avg Drawdown", f"{_bh_metrics['avg_drawdown']:.2%}"),
@@ -1711,7 +1706,8 @@ if run_btn:
                 "Avg DD": f"{_bh_m2['avg_drawdown']:.2%}",
                 "Skew": f"{_bh_m2['skewness']:.3f}",
                 "Kurt": f"{_bh_m2['kurtosis']:.3f}",
-                "TE": "—", "IR": "—",
+                # TASK 7: TE shown as % for consistency with all other rate columns
+                "TE (ann.)": "—", "IR": "—",
                 "Turnover": "0.00×", "Rebal Events": 0,
                 "Turnover ($)": "$0", "Est. Cost ($)": "$0",
             }]
@@ -1741,7 +1737,8 @@ if run_btn:
                     "Avg DD": f"{_m3['avg_drawdown']:.2%}",
                     "Skew": f"{_m3['skewness']:.3f}",
                     "Kurt": f"{_m3['kurtosis']:.3f}",
-                    "TE": f"{_m3['tracking_error']:.4f}",
+                    # TASK 7: TE was shown as raw decimal (0.1234); now % like all other rates
+                    "TE (ann.)": f"{_m3['tracking_error']:.2%}",
                     "IR": f"{_m3['information_ratio']:.3f}",
                     "Turnover": f"{_rs3['turnover_proxy']:.2f}×",
                     "Rebal Events": _rs3["rebalance_count"],
@@ -2186,7 +2183,8 @@ if rebal["enabled"]:
         st.caption(
             f"Est. Cost = Turnover ($) × {_total_cost_rate_d*10000:.0f} bps "
             f"({_commission_bps_d:.0f} commission + {_slippage_bps_d:.0f} slippage + {_bid_ask_bps_d:.0f} bid-ask). "
-            "Sharpe uses Rf=0."
+            "Sharpe uses Rf=0. TE (ann.) = annualized tracking error vs Buy & Hold, shown as %. "
+            "IR = annualized active return ÷ TE (unitless)."
         )
 
         # ── Strategy Ranking ────────────────────────────────────────────────
@@ -2619,20 +2617,27 @@ with st.expander("\u2139\ufe0f Assumptions & Methodology"):
     _tcr_d = p["total_cost_rate"]
     _gst_d = p["global_st_rate"]
     _glt_d = p["global_lt_rate"]
+    # TASK 7: Updated assumptions text for accuracy and consistency with current engine behavior
     st.markdown(f"""
-**Data:** Status 1 (active) and 15 (suspended-but-valid) rows only. Start date shifts forward; end date shifts backward to nearest trading day.
+**Data:** Status 1 (active) and 15 (suspended-but-valid) rows only. Start date shifts forward to next trading day; end date shifts backward to previous trading day.
 
-**Returns:** Price-only (no dividends, no splits in base engine). MSBA v1 optimizer supports dividends via dividend_data.csv.
+**Returns (Buy & Hold / Calendar / Threshold):** Price appreciation only — dividends and splits are not included. For dividend-inclusive returns, use the MSBA v1 Optimizer with a dividend data file.
 
-**Fractional Shares:** Default. Toggle "Whole shares only" for integer shares with cash residual.
+**Dividends (MSBA v1 Optimizer):** When dividend_data.csv is present, dividends are automatically reinvested (DRIP) or held as cash depending on your selection. Total dividends reinvested is shown in the KPI row of the optimizer section.
 
-**Transaction Costs (Calendar/Threshold engines):** Estimated at {_tcr_d*10000:.0f} bps of turnover (sidebar-configurable). **Not deducted from NAV** — shown as a cost estimate in the tables.
+**CAGR:** Annualized geometric return using actual calendar days elapsed ÷ 365.25. For periods under 30 days, CAGR extrapolates aggressively and should be interpreted with caution.
 
-**Transaction Costs (MSBA v1 Optimizer):** Deducted from cash on every trade. Commission {_comm_d:.0f} bps + Slippage {_slip_d:.0f} bps + Bid-Ask {_bask_d:.0f} bps.
+**Annualized Volatility & Tracking Error:** Computed using 252 trading days per year (industry standard for daily data). TE is shown as % in the strategy comparison table.
 
-**Tax:** ST={_gst_d:.0%} / LT={_glt_d:.0%}. Applied in MSBA v1 optimizer with lot-level tracking and carry-forward netting. Calendar/threshold engines use the rates as an estimation reference only.
+**Fractional Shares:** Default. Toggle "Whole shares only" for integer shares with uninvested cash residual.
 
-**Sharpe Ratio:** Risk-free rate = 0 throughout.
+**Transaction Costs (Calendar/Threshold engines):** Estimated at {_tcr_d*10000:.0f} bps total ({_comm_d:.0f} commission + {_slip_d:.0f} slippage + {_bask_d:.0f} bid-ask) applied to turnover dollars. **Not deducted from NAV** — shown as a dollar estimate only.
+
+**Transaction Costs (MSBA v1 Optimizer):** Deducted from portfolio cash on every trade. Same {_comm_d:.0f}+{_slip_d:.0f}+{_bask_d:.0f} bps breakdown as above.
+
+**Tax Rates:** ST={_gst_d:.0%} / LT={_glt_d:.0%} (sidebar-configurable). Applied in the MSBA v1 optimizer with lot-level tracking, wash-sale enforcement, and loss carry-forward netting. Not applied to the base calendar/threshold engines.
+
+**Sharpe Ratio:** Risk-free rate = 0 throughout (appropriate for cross-strategy relative comparison).
     """)
 
 # ── END OF DISPLAY SECTION ────────────────────────────────────────────────
