@@ -85,14 +85,22 @@ class TaxEngine:
         self._ordinary_offset_used = 0.0
         self._ytd_liability = 0.0
 
-    def _compute_ytd_liability(self) -> Tuple[float, float, float, float, float]:
+    def _compute_ytd_liability(self) -> Tuple[float, float, float, float, float, float]:
         """
         Compute current-year cumulative tax liability given:
         - realized totals (st/lt)
         - carryforwards (st/lt)
         - netting and $3k ordinary offset cap
 
-        Returns: (liability, ordinary_offset_used, carryforward_excess_loss, remaining_st_cf, remaining_lt_cf)
+        FIX 1 — Capital loss carryforward character:
+        Returns character-split excess losses so the year-end rollover can push
+        ST excess into st_loss_cf and LT excess into lt_loss_cf separately.
+        Under IRS rules, the character (ST vs LT) of a capital loss must be
+        preserved indefinitely — LT losses must NOT be reclassified as ST.
+
+        Returns:
+          (liability, ordinary_offset_used, excess_st_loss, excess_lt_loss,
+           remaining_st_cf, remaining_lt_cf)
         """
         st = float(self._st_total)
         lt = float(self._lt_total)
@@ -100,6 +108,7 @@ class TaxEngine:
         lt_cf = float(self.lt_loss_cf)
 
         # Apply carryforward losses to same-type gains first, then cross-type.
+        # IRS netting order: ST CF vs ST gains, LT CF vs LT gains, then cross.
         if st > 0 and st_cf > 0:
             used = min(st, st_cf)
             st -= used
@@ -117,7 +126,8 @@ class TaxEngine:
             lt -= used
             st_cf -= used
 
-        # Net ST vs LT within the year (simplified).
+        # Net ST vs LT within the year.
+        # After cross-netting, at most one bucket can remain negative.
         if st > 0 and lt < 0:
             off = min(st, -lt)
             st -= off
@@ -131,19 +141,38 @@ class TaxEngine:
         taxable_lt = max(0.0, lt)
         net = st + lt
 
+        # FIX 1: Compute excess loss split by character.
+        # After all netting, at most one of (st, lt) is negative; the other is 0.
+        # The $3,000 ordinary offset is applied to the loss bucket that remains,
+        # preserving the character of the resulting carryforward.
         ordinary_offset = 0.0
+        excess_st_loss = 0.0
+        excess_lt_loss = 0.0
         if net < 0:
-            ordinary_offset = min(3000.0, -net)
-        carryforward_excess = max(0.0, -net - ordinary_offset)
+            if st < 0:
+                # Net loss is entirely in the ST bucket (lt == 0 here)
+                ordinary_offset = min(3000.0, -st)
+                excess_st_loss = max(0.0, -st - ordinary_offset)
+            else:
+                # Net loss is entirely in the LT bucket (st == 0 here)
+                ordinary_offset = min(3000.0, -lt)
+                # LT excess stays long-term — NOT reclassified as ST
+                excess_lt_loss = max(0.0, -lt - ordinary_offset)
 
         liability = taxable_st * self.st_rate + taxable_lt * self.lt_rate - ordinary_offset * self.st_rate
         liability = float(liability)
-        return liability, ordinary_offset, carryforward_excess, st_cf, lt_cf
+        return liability, ordinary_offset, excess_st_loss, excess_lt_loss, st_cf, lt_cf
 
     def step(self, date, gain: float, gain_type: str, *, count_for_tax: bool = True) -> float:
         """
         Apply a realized gain/loss to the current-year tax ledger and return
         the incremental tax amount (positive=tax owed, negative=refund).
+
+        FIX 2 — Annual tax settlement:
+        The incremental tax delta is returned so the caller can decide whether
+        to deduct it immediately (old behaviour) or accumulate it for year-end
+        settlement. Portfolio.sell() now accumulates into _pending_tax_liability
+        instead of deducting from cash immediately; settlement fires at year-end.
 
         If count_for_tax=False, the event is ignored for tax purposes (used for
         the tax-alpha shadow counterfactual).
@@ -152,14 +181,13 @@ class TaxEngine:
         if self._year is None:
             self._reset_year(year)
         elif year != self._year:
-            # Roll remaining excess loss into carryforward at year boundary.
-            # rem_st_cf / rem_lt_cf reflect what's left after this year's gains consumed
-            # the prior-year carryforward — persist those so they aren't recycled.
-            _, _, excess_loss, rem_st_cf, rem_lt_cf = self._compute_ytd_liability()
-            self.st_loss_cf = rem_st_cf
-            self.lt_loss_cf = rem_lt_cf
-            if excess_loss > 0:
-                self.st_loss_cf += excess_loss
+            # FIX 1: Preserve character when rolling excess losses forward.
+            # rem_st_cf / rem_lt_cf = prior-year CF not consumed by this year's gains.
+            # excess_st_loss / excess_lt_loss = this year's net loss beyond $3k offset.
+            # Both are accumulated into the SAME-CHARACTER carryforward bucket.
+            _, _, excess_st, excess_lt, rem_st_cf, rem_lt_cf = self._compute_ytd_liability()
+            self.st_loss_cf = rem_st_cf + excess_st   # ST losses stay ST
+            self.lt_loss_cf = rem_lt_cf + excess_lt   # LT losses stay LT
             self._reset_year(year)
 
         prev_liab = self._ytd_liability
@@ -170,16 +198,9 @@ class TaxEngine:
             else:
                 self._lt_total += gain
 
-        liab, ordinary_offset, excess_loss, _, _ = self._compute_ytd_liability()
+        liab, ordinary_offset, _, _, _, _ = self._compute_ytd_liability()
         self._ordinary_offset_used = ordinary_offset
         self._ytd_liability = liab
-
-        # At all times, enforce that excess loss beyond (gains + 3000) remains as carryforward
-        # rather than creating additional refunds.
-        if excess_loss > 0:
-            # represent as carryforward bucket (ST for simplicity)
-            # but do not double-count: only hold in carryforward implicitly at year-end.
-            pass
 
         return float(self._ytd_liability - prev_liab)
 
@@ -326,6 +347,11 @@ class Portfolio:
         self.total_commission_and_slippage: float = 0.0  # cumulative execution costs
         self.total_losses_harvested: float = 0.0          # absolute value of harvested losses
 
+        # FIX 2 — Annual tax settlement:
+        # Accumulate incremental tax deltas throughout the year; settle to cash at year-end.
+        # This prevents phantom leverage from daily tax refunds inflating TLH performance.
+        self._pending_tax_liability: float = 0.0
+
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _nid(self, prefix: str, counter_attr: str) -> str:
@@ -465,8 +491,8 @@ class Portfolio:
                 "tax_owed": tax, "lot_id": lot["lot_id"], "reason": reason,
             })
             if abs(tax) > 1e-12:
-                self.cash -= tax
-                self.total_tax_paid += tax
+                # FIX 2: Accumulate rather than deduct immediately; settled at year-end.
+                self._pending_tax_liability += tax
                 self._taxes.append({"date": date, "event_id": eid, "amount": tax})
             if gain < 0:
                 self.total_losses_harvested += abs(gain)
@@ -520,6 +546,23 @@ class Portfolio:
 
     def nav(self, prices: Dict[str, float]) -> float:
         return self.market_value(prices) + self.cash
+
+    # ── tax settlement ────────────────────────────────────────────────────────
+
+    def settle_annual_taxes(self) -> float:
+        """
+        FIX 2 — Annual tax settlement.
+        Debit (or credit) the accumulated pending tax liability against cash.
+        Called at the start of each new calendar year and once at simulation end.
+
+        Returns the net amount settled (positive = taxes paid, negative = net refund).
+        """
+        amount = self._pending_tax_liability
+        if abs(amount) > 1e-12:
+            self.cash -= amount
+            self.total_tax_paid += amount
+        self._pending_tax_liability = 0.0
+        return amount
 
     # ── output accessors ──────────────────────────────────────────────────────
 
@@ -828,10 +871,20 @@ def run_optimizer_simulation(
     prices_d0 = {tk: float(wide.loc[day0, tk]) for tk in all_needed_list}
     nav_arr[0] = pf.nav(prices_d0)
 
+    # FIX 2: Track current simulation year for annual tax settlement detection.
+    _sim_current_year = trading_dates[0].year
+
     # ── Daily loop ────────────────────────────────────────────────────────────
     for i in range(1, n_days):
         dt = trading_dates[i]
         prices_today = {tk: float(wide.loc[dt, tk]) for tk in all_needed_list}
+
+        # FIX 2: Settle prior-year tax liability at the first trading day of each new year.
+        # This mirrors annual tax payment (e.g., Dec 31 settlement) — cash leaves the portfolio
+        # once per year rather than on each trade day, eliminating phantom leverage.
+        if dt.year != _sim_current_year:
+            pf.settle_annual_taxes()
+            _sim_current_year = dt.year
         tlh_fired_today = False  # reset each day; suppresses drift check if TLH ran
 
         # Daily callbacks (capture current dt from loop)
@@ -915,6 +968,9 @@ def run_optimizer_simulation(
 
         # 5. Record NAV
         nav_arr[i] = pf.nav(prices_today)
+
+    # FIX 2: Settle any remaining tax liability accrued in the final (partial) year.
+    pf.settle_annual_taxes()
 
     # ── Build output ──────────────────────────────────────────────────────────
     nav_series = pd.Series(nav_arr, index=trading_dates, name="NAV")

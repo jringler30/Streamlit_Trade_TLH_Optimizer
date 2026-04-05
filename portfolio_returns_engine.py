@@ -604,20 +604,23 @@ def compute_drift(
     Two modes reflect different portfolio management philosophies:
     - Absolute: |w_i - target_i|. Simple, intuitive. A 50% target drifting to
       55% has the same drift (5pp) as a 5% target drifting to 10%.
-    - Relative: |w_i / target_i - 1|. Proportional. The 5%→10% drift is 100%
-      relative drift, while 50%→55% is only 10%. Better for portfolios with
-      very different-sized allocations.
+    - Relative: |log(w_i / target_i)|. Symmetric log-ratio. The 2%→4% drift
+      equals the 4%→2% drift (both are log(2) ≈ 0.693). The naive formula
+      |w/tgt - 1| is asymmetric: doubling gives 100% but halving gives only 50%.
     """
     drift = {}
     for tk in target_weights:
         w_cur = current_weights.get(tk, 0.0)
         w_tgt = target_weights[tk]
         if drift_mode == "Relative":
-            # Guard against division by zero for zero-weight targets
-            if w_tgt < 1e-12:
-                drift[tk] = abs(w_cur)
+            # FIX 4: Use symmetric log-ratio instead of |w/tgt - 1|.
+            # Guards: use a small floor (1e-12) to avoid log(0).
+            if w_tgt >= 1e-12 and w_cur > 1e-12:
+                drift[tk] = abs(np.log(w_cur / w_tgt))
+            elif w_tgt >= 1e-12:
+                drift[tk] = abs(np.log(1e-12 / w_tgt))
             else:
-                drift[tk] = abs(w_cur / w_tgt - 1.0)
+                drift[tk] = abs(w_cur)
         else:
             drift[tk] = abs(w_cur - w_tgt)
     return drift
@@ -1069,9 +1072,11 @@ def compute_strategy_metrics(daily_values, initial_capital, benchmark_values=Non
         active_rets = active_rets[np.isfinite(active_rets)]
         tracking_error = float(np.std(active_rets, ddof=1) * np.sqrt(252)) if len(active_rets) > 1 else 0.0
         if tracking_error > 1e-12:
-            # Annualize active return: daily mean × 252 trading days
-            ann_active_mean = float(np.mean(active_rets) * 252)
-            information_ratio = ann_active_mean / tracking_error
+            # FIX 3: IR numerator = CAGR difference (not mean(daily) * 252).
+            # mean(daily) * 252 compounds arithmetic drift; CAGR difference is the
+            # true geometric excess return over the period.
+            bm_cagr = float((bm_vals[-1] / bm_vals[0]) ** (1.0 / years) - 1.0)
+            information_ratio = (cagr - bm_cagr) / tracking_error
 
     return {
         "total_return": round(total_return, 6),
