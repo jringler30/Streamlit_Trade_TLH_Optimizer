@@ -83,10 +83,12 @@ def to_excel_bytes(dfs: Dict[str, pd.DataFrame]) -> bytes:
     Serialize one or more DataFrames to an Excel workbook in memory.
     Keys in dfs become sheet names. Returns raw bytes for st.download_button.
     """
+    _ILLEGAL = str.maketrans({c: "-" for c in r'[]:*?/\\'})
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet, df in dfs.items():
-            df.to_excel(writer, sheet_name=sheet[:31], index=False)
+            safe = sheet.translate(_ILLEGAL)[:31]
+            df.to_excel(writer, sheet_name=safe, index=False)
     return buf.getvalue()
 
 
