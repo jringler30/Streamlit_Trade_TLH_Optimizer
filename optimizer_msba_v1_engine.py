@@ -16,8 +16,6 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Literal
 import warnings
 
-warnings.filterwarnings("ignore")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,7 +72,9 @@ class TaxEngine:
 
     def classify(self, open_date, close_date) -> Tuple[str, float]:
         days = (close_date - open_date).days
-        if days >= self.lt_days:
+        # IRS "more than one year" = strictly more than 365 days (366+ days = LT).
+        # Using >= 365 was an off-by-one error: a 365-day hold is still short-term.
+        if days > self.lt_days:
             return "LT", self.lt_rate
         return "ST", self.st_rate
 
@@ -437,10 +437,14 @@ class Portfolio:
     def sell(self, date, ticker: str, shares: float, price: float, lot_selection: str = "TAX_OPTIMAL",
              reason: str = "", *, tax_count_for_this_sale: Optional[callable] = None,
              on_loss_realized: Optional[callable] = None,
-             check_wash_sale_lookback: Optional[callable] = None):
+             check_wash_sale_lookback: Optional[callable] = None,
+             lot_ids: Optional[List[str]] = None):
         """
         Execute a sell order with lot selection, realize gains/losses, pay taxes.
 
+        lot_ids: if provided, only consume from these specific lots (in order given).
+            Used by TLH to enforce exact lot-level harvesting. When None, falls back
+            to lot_selection ordering (TAX_OPTIMAL or FIFO).
         on_loss_realized: optional callback(ticker=str, loss_amount=float) when a loss is realized.
         check_wash_sale_lookback: optional callback(ticker=str, date=timestamp) -> bool to validate
                                    30-day lookback (returns True if sale would violate wash-sale rule).
@@ -462,7 +466,15 @@ class Portfolio:
         net_proceeds = gross_proceeds - exec_cost
         self.total_commission_and_slippage += exec_cost
 
-        if lot_selection == "TAX_OPTIMAL":
+        if lot_ids is not None:
+            # Precise lot-level selection: only sell from the specified lots, in order.
+            # Used by TLH to guarantee the identified loss lots are actually harvested.
+            lots = [
+                self._lots[self._lot_id_map[lid]]
+                for lid in lot_ids
+                if lid in self._lot_id_map and self._lots[self._lot_id_map[lid]]["shares"] > 1e-12
+            ]
+        elif lot_selection == "TAX_OPTIMAL":
             lots = self._sorted_lots_for_sell(ticker, price, date)
         else:
             lots = sorted(self._open_lots(ticker), key=lambda x: x["open_date"])
@@ -517,21 +529,31 @@ class Portfolio:
     # ── dividend ──────────────────────────────────────────────────────────────
 
     def process_dividend(self, date, ticker: str, div_per_share: float,
-                         price: float, reinvest: bool, *, on_buy_executed: Optional[callable] = None):
+                         price: float, reinvest: bool, *,
+                         on_buy_executed: Optional[callable] = None,
+                         dividend_tax_rate: float = 0.0):
         """
-        Process dividend: add to cash, optionally reinvest (DRIP).
+        Process dividend: tax it, add after-tax amount to cash, optionally reinvest (DRIP).
 
+        dividend_tax_rate: fractional tax rate on dividend income (e.g. 0.20).
+            Most ETF and equity dividends qualify for the long-term capital gains rate.
+            Defaults to 0.0 for backward compatibility; callers should pass lt_rate for
+            realistic after-tax modeling.
         on_buy_executed: optional callback to notify wash-sale tracker of DRIP purchases.
         """
         held = self.shares_held(ticker)
         if held < 1e-12:
             return
         gross = held * div_per_share
-        # No separate dividend tax in MSBA v1 — dividends treated as income
-        self.cash += gross
+        tax = gross * dividend_tax_rate
+        net = gross - tax
+        self.cash += net
+        if abs(tax) > 1e-12:
+            self.total_tax_paid += tax
 
         if reinvest and price > 0:
-            drip_shares = gross / price
+            # DRIP: reinvest after-tax dividend proceeds (not gross)
+            drip_shares = net / price
             self.buy(date, ticker, drip_shares, price, source="DRIP",
                      on_buy_executed=on_buy_executed)
 
@@ -624,8 +646,11 @@ def _compute_drift(current_weights: dict, target_weights: dict, mode: str) -> di
     target_weights : dict
         Target portfolio weights {ticker: weight}
     mode : str
-        "Absolute": |w_current - w_target|
-        "Relative": |w_current / w_target - 1|
+        "Absolute": |w_current - w_target|  (percentage-point deviation)
+        "Relative": |log(w_current / w_target)|  (symmetric log-ratio)
+            The log-ratio is used instead of |w/tgt - 1| because it is symmetric:
+            a drift from 10% → 5% has the same magnitude as 5% → 10%.
+            This matches the formula used by the V4 threshold engine.
 
     Returns
     -------
@@ -635,7 +660,13 @@ def _compute_drift(current_weights: dict, target_weights: dict, mode: str) -> di
     for tk, w_tgt in target_weights.items():
         w_cur = current_weights.get(tk, 0.0)
         if mode == "Relative":
-            drift[tk] = abs(w_cur / w_tgt - 1.0) if w_tgt != 0 else abs(w_cur)
+            # Symmetric log-ratio — consistent with compute_drift() in portfolio_returns_engine.py
+            if w_tgt >= 1e-12 and w_cur > 1e-12:
+                drift[tk] = abs(np.log(w_cur / w_tgt))
+            elif w_tgt >= 1e-12:
+                drift[tk] = abs(np.log(1e-12 / w_tgt))
+            else:
+                drift[tk] = abs(w_cur)
         else:
             drift[tk] = abs(w_cur - w_tgt)
     return drift
@@ -728,7 +759,16 @@ def run_optimizer_simulation(
     sub = prices_df.loc[mask, ["TICKERSYMBOL", "PRICEDATE", price_field]].copy()
     sub = sub.drop_duplicates(subset=["TICKERSYMBOL", "PRICEDATE"])
     wide = sub.pivot(index="PRICEDATE", columns="TICKERSYMBOL", values=price_field)
-    wide = wide.sort_index().ffill().bfill()
+    wide = wide.sort_index().ffill()
+    # Drop rows where any ticker still lacks a price (i.e., its history starts after
+    # the requested start date). Backward fill is intentionally omitted — it would
+    # propagate future prices into earlier dates, introducing lookahead bias.
+    wide = wide.dropna()
+    if wide.empty:
+        raise ValueError(
+            "No common trading dates found for all tickers after forward-fill. "
+            "One or more tickers may lack price history at the requested start date."
+        )
 
     missing = [t for t in all_needed_list if t not in wide.columns]
     if missing:
@@ -892,12 +932,13 @@ def run_optimizer_simulation(
             """Track loss sale for 30-day forward block (current day)."""
             wash_tracker.record_loss_sale(ticker, dt)
 
-        # 1. Dividends
+        # 1. Dividends — taxed at lt_rate (qualified dividend assumption)
         for tk in all_needed_list:
             div_amt = div_lookup.get((tk, dt))
             if div_amt is not None and div_amt > 0:
                 pf.process_dividend(dt, tk, div_amt, prices_today.get(tk, 0.0), reinvest_dividends,
-                                    on_buy_executed=_on_buy_executed)
+                                    on_buy_executed=_on_buy_executed,
+                                    dividend_tax_rate=tax_rates.get("lt_rate", 0.20))
 
         # 2. Tax-Loss Harvesting — check each lot
         if tlh_threshold > 0:
@@ -926,10 +967,13 @@ def run_optimizer_simulation(
 
                 for lot_id, lot_shares in lots_to_harvest:
                     tlh_fired_today = True  # suppress drift check this day
-                    # Sell the lot (TLH-triggered)
+                    # Sell the specific identified lot (not TAX_OPTIMAL generic ordering).
+                    # Passing lot_ids=[lot_id] ensures we harvest exactly the lot whose
+                    # loss crossed the threshold, not whatever TAX_OPTIMAL happens to pick.
                     px = prices_today[tk]
                     pf.sell(
-                        dt, tk, lot_shares, px, lot_selection="TAX_OPTIMAL",
+                        dt, tk, lot_shares, px,
+                        lot_ids=[lot_id],
                         reason=f"TLH_SELL:{tk}",
                         on_loss_realized=_on_loss_realized,
                         check_wash_sale_lookback=_check_wash_sale_lookback,
@@ -1015,6 +1059,7 @@ def run_optimizer_simulation(
             drift_tolerance=drift_tolerance,
             drift_mode=drift_mode,
             drift_cooldown=drift_cooldown,
+            forced_rebalance_dates=forced_rebalance_dates,
         )
         nav_no_tlh = base["nav_series"].reindex(nav_series.index).ffill()
         tax_alpha_2 = nav_series - nav_no_tlh

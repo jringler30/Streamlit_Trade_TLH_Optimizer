@@ -57,10 +57,17 @@ The dashboard will open in your browser at `http://localhost:8501`.
 ```
 portfolio-tlh-optimizer/
 │
-├── portfolio_returns_engine.py        # Main Streamlit app + simulation logic
+├── engine/                            # Pure computation package (no Streamlit dependency)
+│   ├── __init__.py                    # Re-exports all public functions
+│   ├── core.py                        # validate_weights, calculate_portfolio_returns, build_*
+│   ├── rebalancing.py                 # Calendar + threshold (drift-band) rebalancing engines
+│   └── metrics.py                     # compute_strategy_metrics (CAGR, Sharpe, Calmar, TE, IR)
+│
+├── portfolio_returns_engine.py        # Streamlit app — imports from engine/, renders UI
 ├── optimizer_msba_v1_engine.py        # Tax-aware TLH engine (lot tracking, wash-sale)
 ├── ui_style.py                        # Bloomberg dark theme + CSS helpers
-├── dividend_data.csv                  # Dividend reference dataset
+├── dividend_data.csv                  # Dividend reference dataset (PAYDATE-based)
+├── proxy_lookup.csv                   # TLH proxy ticker pairs
 ├── requirements.txt                   # Python dependencies
 │
 ├── Backtest/
@@ -71,19 +78,37 @@ portfolio-tlh-optimizer/
 ├── pages/
 │   └── 01_Engine_Documentation.py     # Tabbed engine documentation
 │
-├── tests/
-│   └── test_msba_engine.py            # Unit tests for tax engine
+├── test_msba_engine.py                # Unit tests — imports from engine/ directly (no Streamlit mock needed)
+├── conftest.py                        # Streamlit + data mocks for defensive test isolation
 │
-├── assets/
-│   └── Dashboard.png                  # UI screenshot
+├── Dashboard.png                      # UI screenshot
 │
-├── archive/                           # Prior exploratory notebooks
-│   ├── vise_tlh_backtest_monthly_v2.ipynb
-│   ├── vise_rebalancing_recommendation.ipynb
-│   └── tlh_multi_security_prototype.ipynb
-│
-└── docs/
-    └── CONTRIBUTING.md
+└── archive/                           # Prior exploratory notebooks
+    ├── vise_tlh_backtest_monthly_v2.ipynb
+    ├── vise_rebalancing_recommendation.ipynb
+    └── tlh_multi_security_prototype.ipynb
+```
+
+### Data Flow
+
+```
+Raw Data (parquet) → load_data() → prepare_price_data()
+                                         │
+                    ┌────────────────────┼─────────────────────┐
+                    ▼                    ▼                      ▼
+           engine/core.py        engine/rebalancing.py   optimizer_msba_v1_engine.py
+     calculate_portfolio_returns  build_rebalanced_series  run_optimizer_simulation
+     build_daily_series           build_threshold_series   (lot tracking, TLH, wash-sale)
+     build_prices_wide                    │
+                    │                    │
+                    └────────────────────┘
+                                │
+                         engine/metrics.py
+                    compute_strategy_metrics
+                    (CAGR, Sharpe, Calmar, TE, IR)
+                                │
+                    portfolio_returns_engine.py (Streamlit UI)
+                    Session state → charts → tables → Excel export
 ```
 
 ---
@@ -155,6 +180,42 @@ The **Engine Documentation** page (accessible from the sidebar) covers five topi
 | Analytics | SciPy, Plotly |
 | Export | openpyxl |
 | CI | GitHub Actions (Python 3.11, flake8) |
+
+---
+
+---
+
+## What This Project Demonstrates
+
+| Skill | Implementation |
+|---|---|
+| Tax-aware portfolio simulation | Lot-level accounting: ST/LT classification, loss carry-forward, $3k ordinary offset, annual settlement |
+| Wash-sale modeling | 30-day lookback + 30-day forward block; automatic proxy substitution |
+| Rebalancing strategy comparison | Buy-and-hold → calendar → threshold drift-band; all on consistent net-of-cost basis |
+| Financial metrics | CAGR, Sharpe (Rf=0), max/avg drawdown, tracking error, information ratio, Calmar |
+| Production-grade architecture | Engine separated from UI; `@st.cache_data` for data loading; session state for result persistence |
+| Streamlit productization | Bloomberg dark theme, per-asset controls, Excel export, stale-results detection |
+| Quantitative testing | Pytest suite with financially meaningful expected values; Streamlit mock for isolated imports |
+
+---
+
+## Modeling Assumptions and Limitations
+
+The following assumptions govern the simulation. Understanding them is important for
+interpreting results correctly.
+
+| Assumption | Detail |
+|---|---|
+| **Transaction costs** | Embedded in NAV on every rebalance (commission + slippage + bid-ask, configurable in sidebar). Rebalancing engines and the optimizer engine are on the same net-of-cost basis. |
+| **Dividends** | Modeled in the MSBA v1 Optimizer only (via `dividend_data.csv`). Taxed at the long-term capital gains rate (qualified dividend assumption). The Buy & Hold and calendar/threshold rebalancing baselines are **price-return only** — dividends are not included. Cross-strategy NAV comparisons are therefore not apples-to-apples when dividends are material. |
+| **Dividend timing** | Uses `PAYDATE` (payment date) rather than `EXDATE` (ex-dividend date). This introduces a short timing lag between when the stock price adjusts for the dividend and when cash is received. |
+| **Execution timing** | Calendar rebalancing executes at same-day closing prices (standard backtesting simplification). Threshold drift-band rebalancing uses next-day execution (more realistic). TLH executes same-day. |
+| **ST/LT classification** | IRS rule: "more than one year" = **more than 365 calendar days** (366+ days = long-term). |
+| **Wash-sale** | 30-day lookback (cannot TLH if bought within 30 days before) and 30-day forward block (cannot rebuy original within 30 days after loss sale). Proxies from `proxy_lookup.csv` are used automatically. |
+| **Survivorship bias** | The price dataset covers active tickers. Users selecting tickers from the dropdown are implicitly selecting survivors. Historical results for individual securities may be biased upward. |
+| **Fractional shares** | All simulations use fractional shares (no whole-share rounding), which is realistic for most ETFs but may not hold for all securities. |
+| **No margin, no short selling** | Long-only portfolios only. |
+| **State and local taxes** | Not modeled. Only federal ST/LT capital gains and ordinary income offset are implemented. |
 
 ---
 
