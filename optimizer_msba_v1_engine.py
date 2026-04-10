@@ -374,7 +374,14 @@ class Portfolio:
         ]
 
     def _sorted_lots_for_sell(self, ticker: str, price: float, date) -> List[dict]:
-        """TAX_OPTIMAL ordering: losses first (biggest ST loss first), then smallest gains."""
+        """
+        TAX_OPTIMAL ordering for selling:
+          1. ST losses  (highest tax benefit — offset 35% income)
+          2. LT losses  (offset 20% income)
+          3. LT gains   (lowest tax cost — taxed at 20%)
+          4. ST gains   (highest tax cost — taxed at 35%, sell last)
+        Within each group, most negative P&L first (biggest losses / smallest gains).
+        """
         lots = self._open_lots(ticker)
         if not lots:
             return lots
@@ -383,7 +390,11 @@ class Portfolio:
             lot["_days"] = (date - lot["open_date"]).days
             lot["_is_loss"] = 1 if lot["_pnl"] < 0 else 0
             lot["_is_lt"] = 1 if lot["_days"] >= self.tax.lt_days else 0
-        lots.sort(key=lambda x: (-x["_is_loss"], x["_is_lt"], x["_pnl"]))
+        lots.sort(key=lambda x: (
+            -x["_is_loss"],                                       # losses before gains
+            x["_is_lt"] if x["_is_loss"] else -x["_is_lt"],      # losses: ST first; gains: LT first
+            x["_pnl"],                                            # most negative P&L first
+        ))
         return lots
 
     # ── buy ───────────────────────────────────────────────────────────────────
