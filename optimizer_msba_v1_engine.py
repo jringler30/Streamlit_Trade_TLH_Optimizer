@@ -597,6 +597,65 @@ class Portfolio:
         self._pending_tax_liability = 0.0
         return amount
 
+    # ── liquidation ─────────────────────────────────────────────────────────
+
+    def liquidation_value(self, prices: Dict[str, float], date) -> Dict[str, float]:
+        """
+        Compute after-tax liquidation value if all positions were sold today.
+
+        Accounts for:
+        - Unrealized ST and LT gains across all open lots
+        - Loss carryforwards (ST and LT) that offset liquidation gains
+        - Current-year realized gains already in the tax ledger
+        - IRS netting rules and $3k ordinary income offset
+
+        Returns dict with:
+          liquidation_nav       : after-tax cash after selling everything
+          unrealized_gain_st    : total unrealized short-term P&L
+          unrealized_gain_lt    : total unrealized long-term P&L
+          liquidation_tax       : additional tax owed from full liquidation
+        """
+        unrealized_st = 0.0
+        unrealized_lt = 0.0
+        for lot in self._lots:
+            if lot["shares"] < 1e-12:
+                continue
+            px = prices.get(lot["ticker"], 0.0)
+            gain = (px - lot["cost_basis"]) * lot["shares"]
+            gain_type, _ = self.tax.classify(lot["open_date"], date)
+            if gain_type == "ST":
+                unrealized_st += gain
+            else:
+                unrealized_lt += gain
+
+        # Temporarily add unrealized gains to tax engine to compute liability
+        saved_st = self.tax._st_total
+        saved_lt = self.tax._lt_total
+        self.tax._st_total += unrealized_st
+        self.tax._lt_total += unrealized_lt
+        new_liab = self.tax._compute_ytd_liability()[0]
+        # Restore state (no mutation)
+        self.tax._st_total = saved_st
+        self.tax._lt_total = saved_lt
+
+        current_liab = self.tax._compute_ytd_liability()[0]
+        liquidation_tax = new_liab - current_liab
+
+        # Execution costs on selling all positions
+        mv = self.market_value(prices)
+        liq_exec_cost = mv * self._cost_rate
+
+        nav = self.nav(prices)
+        liq_nav = nav - self._pending_tax_liability - liquidation_tax - liq_exec_cost
+
+        return {
+            "liquidation_nav": round(liq_nav, 2),
+            "unrealized_gain_st": round(unrealized_st, 2),
+            "unrealized_gain_lt": round(unrealized_lt, 2),
+            "liquidation_tax": round(liquidation_tax, 2),
+            "liquidation_exec_cost": round(liq_exec_cost, 2),
+        }
+
     # ── output accessors ──────────────────────────────────────────────────────
 
     def trades_df(self) -> pd.DataFrame:
@@ -1074,6 +1133,11 @@ def run_optimizer_simulation(
     nav_series.index.name = "PRICEDATE"
 
     cfg = {**DEFAULT_COST_CONFIG, **(cost_config or {})}
+
+    # Compute after-tax liquidation value at simulation end
+    final_prices = {tk: float(wide.loc[trading_dates[-1], tk]) for tk in all_needed_list}
+    liq = pf.liquidation_value(final_prices, trading_dates[-1])
+
     out = {
         "nav_series": nav_series,
         "trades_df": pf.trades_df(),
@@ -1085,6 +1149,11 @@ def run_optimizer_simulation(
         "ordinary_income_offset_used_ytd_final": pf.tax.ordinary_offset_used_ytd,
         "loss_carryforward_st": float(pf.tax.st_loss_cf),
         "loss_carryforward_lt": float(pf.tax.lt_loss_cf),
+        "liquidation_nav": liq["liquidation_nav"],
+        "unrealized_gain_st": liq["unrealized_gain_st"],
+        "unrealized_gain_lt": liq["unrealized_gain_lt"],
+        "liquidation_tax": liq["liquidation_tax"],
+        "liquidation_exec_cost": liq["liquidation_exec_cost"],
     }
 
     # ── Tax Alpha computations ────────────────────────────────────────────────
