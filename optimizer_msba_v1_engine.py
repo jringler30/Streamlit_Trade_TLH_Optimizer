@@ -900,8 +900,9 @@ def run_optimizer_simulation(
         buy_tk = _resolve_buy_symbol(tk, day0)
         price = wide.loc[day0, buy_tk]
         shares = alloc / price
-        pf.buy(day0, buy_tk, shares, price, reason=f"INIT:{tk}",
-               on_buy_executed=_on_buy_executed)
+        # Do NOT record initial buys in wash-sale tracker — portfolio construction
+        # is not a "repurchase" that should block TLH for the first 30 days.
+        pf.buy(day0, buy_tk, shares, price, reason=f"INIT:{tk}")
 
     # ── Pre-allocate NAV array ────────────────────────────────────────────────
     n_days = len(trading_dates)
@@ -940,7 +941,7 @@ def run_optimizer_simulation(
                                     on_buy_executed=_on_buy_executed,
                                     dividend_tax_rate=tax_rates.get("lt_rate", 0.20))
 
-        # 2. Tax-Loss Harvesting — check each lot
+        # 2. Tax-Loss Harvesting — check each lot (original AND proxy lots)
         if tlh_threshold > 0:
             for tk in tickers:
                 # SKIP TLH for tickers without proxies to avoid cash drag
@@ -953,37 +954,45 @@ def run_optimizer_simulation(
                     # No proxy_df loaded, skip TLH for all tickers
                     continue
 
-                lots_to_harvest = []
-                # Harvest only original ticker lots (not proxies)
-                for lot in pf._open_lots(tk):
-                    if lot["shares"] < 1e-12:
-                        continue
-                    px = prices_today.get(tk, 0.0)
-                    if px <= 0:
-                        continue
-                    unrealized_pct = (px - lot["cost_basis"]) / lot["cost_basis"]
-                    if unrealized_pct <= -tlh_threshold:
-                        lots_to_harvest.append((lot["lot_id"], lot["shares"]))
+                # Check ALL sleeve tickers (original + proxies) for harvestable lots
+                sleeve_tickers = proxy_resolver.sleeve_all_tickers(tk)
+                lots_to_harvest = []  # (sell_ticker, lot_id, lot_shares)
+                for stk in sleeve_tickers:
+                    for lot in pf._open_lots(stk):
+                        if lot["shares"] < 1e-12:
+                            continue
+                        px = prices_today.get(stk, 0.0)
+                        if px <= 0:
+                            continue
+                        unrealized_pct = (px - lot["cost_basis"]) / lot["cost_basis"]
+                        if unrealized_pct <= -tlh_threshold:
+                            lots_to_harvest.append((stk, lot["lot_id"], lot["shares"]))
 
-                for lot_id, lot_shares in lots_to_harvest:
+                for sell_tk, lot_id, lot_shares in lots_to_harvest:
                     tlh_fired_today = True  # suppress drift check this day
                     # Sell the specific identified lot (not TAX_OPTIMAL generic ordering).
                     # Passing lot_ids=[lot_id] ensures we harvest exactly the lot whose
                     # loss crossed the threshold, not whatever TAX_OPTIMAL happens to pick.
-                    px = prices_today[tk]
+                    px = prices_today[sell_tk]
                     pf.sell(
-                        dt, tk, lot_shares, px,
+                        dt, sell_tk, lot_shares, px,
                         lot_ids=[lot_id],
-                        reason=f"TLH_SELL:{tk}",
+                        reason=f"TLH_SELL:{sell_tk}",
                         on_loss_realized=_on_loss_realized,
                         check_wash_sale_lookback=_check_wash_sale_lookback,
                     )
-                    # Rebuy using proxy if original is blocked; skip if no valid proxy available
-                    rebuy_tk = _resolve_buy_symbol(tk, dt)
-                    rebuy_px = prices_today.get(rebuy_tk, 0.0)
-                    if rebuy_tk == tk and wash_tracker.is_buy_blocked(tk, dt):
-                        pass  # No valid proxy found; skip rebuy to avoid wash-sale violation
-                    elif rebuy_px > 0:
+                    # Rebuy using a DIFFERENT sleeve ticker (not the one just sold)
+                    rebuy_tk = None
+                    for candidate in sleeve_tickers:
+                        if candidate == sell_tk:
+                            continue  # can't rebuy what we just sold
+                        if wash_tracker.is_buy_blocked(candidate, dt):
+                            continue  # wash-sale blocked
+                        if prices_today.get(candidate, 0.0) > 0:
+                            rebuy_tk = candidate
+                            break
+                    if rebuy_tk is not None:
+                        rebuy_px = prices_today[rebuy_tk]
                         rebuy_dollars = lot_shares * px  # match sell proceeds, not share count
                         rebuy_shares = rebuy_dollars / rebuy_px
                         pf.buy(dt, rebuy_tk, rebuy_shares, rebuy_px, source="TLH_REBUY",

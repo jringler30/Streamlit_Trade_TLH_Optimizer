@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python3 << 'EOF':*)",
+      "Bash(PYTHONIOENCODING=utf-8 python3 -c \"\nimport csv\ntickers = ['AGG','IVV','LQD','MBB','TLH','EFA','EFV','IVW','IVE','EEM','TIP','EFG','EMB','IEF','OEF','GLD','IWF','IYW','SPY','TLT']\nwith open\\(r'C:\\\\Users\\\\ry092\\\\Desktop\\\\MIS 382N - Capstone\\\\Vise-Capstone-Project\\\\vise-mar-21\\\\proxy_lookup.csv', encoding='utf-8'\\) as f:\n    reader = csv.DictReader\\(f\\)\n    for row in reader:\n        sym = row['symbol'].strip\\(\\).upper\\(\\)\n        if sym in tickers:\n            print\\(f\\\\\"{sym:5s} -> {row['lookup_symbol'].strip\\(\\).upper\\(\\):6s}  \\(order={row['order']}, type={row['lookup_type']}\\)\\\\\"\\)\")"
+    ]
+  }
+}
