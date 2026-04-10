@@ -1128,6 +1128,11 @@ def run_optimizer_simulation(
     # FIX 2: Settle any remaining tax liability accrued in the final (partial) year.
     pf.settle_annual_taxes()
 
+    # Re-record final NAV after settlement so it reflects all tax payments/refunds.
+    # Without this, Final NAV is pre-settlement and Liquidation NAV is post-settlement,
+    # causing Liquidation NAV > Final NAV when a pending refund exists.
+    nav_arr[-1] = pf.nav(prices_today)
+
     # ── Build output ──────────────────────────────────────────────────────────
     nav_series = pd.Series(nav_arr, index=trading_dates, name="NAV")
     nav_series.index.name = "PRICEDATE"
