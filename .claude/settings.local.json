@@ -11,7 +11,11 @@
       "Bash(PYTHONIOENCODING=utf-8 python3 -c \":*)",
       "Bash(pip install:*)",
       "Bash(python -c \":*)",
-      "Bash(python Backtest/analysis_check.py)"
+      "Bash(python Backtest/analysis_check.py)",
+      "Bash(where python:*)",
+      "Bash(where python3:*)",
+      "Bash(\"/c/Users/ry092/anaconda3/python.exe\" --version)",
+      "Bash(python analysis_check.py)"
     ]
   }
 }
