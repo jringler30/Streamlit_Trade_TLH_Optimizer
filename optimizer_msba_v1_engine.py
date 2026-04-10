@@ -832,6 +832,28 @@ def run_optimizer_simulation(
                 total += sh * prices_today.get(tk, 0.0)
         return total, held
 
+    tickers_set = set(tickers)
+
+    def _attributed_value_and_holdings(original_symbol: str, prices_today: Dict[str, float]) -> Tuple[float, List[Tuple[str, float]]]:
+        """
+        Like _sleeve_value_and_holdings but prevents double-counting when
+        portfolio tickers are each other's proxies (e.g., IVV ↔ OEF both in
+        the portfolio). Skips proxy tickers that are separate portfolio allocations.
+
+        Used by rebalancing and drift calculation where non-overlapping
+        attribution is required.
+        """
+        total = 0.0
+        held: List[Tuple[str, float]] = []
+        for tk in proxy_resolver.sleeve_all_tickers(original_symbol):
+            if tk != original_symbol and tk in tickers_set:
+                continue  # managed as its own portfolio allocation
+            sh = pf.shares_held(tk)
+            if sh > 1e-12:
+                held.append((tk, sh))
+                total += sh * prices_today.get(tk, 0.0)
+        return total, held
+
     # ── Callbacks for wash-sale tracking (general, no date dependency) ──────────
     def _on_buy_executed(ticker: str, date):
         """Track purchase for 30-day lookback validation."""
@@ -844,15 +866,20 @@ def run_optimizer_simulation(
     def _execute_rebalance(dt, reason_prefix: str):
         """
         Execute a rebalance: sell overweight assets, then buy underweight assets.
-        Requires: dt, prices_today, pf, tickers, weight_map, _sleeve_value_and_holdings,
-                  _resolve_buy_symbol, _on_loss_realized, _check_wash_sale_lookback, _on_buy_executed
+
+        Uses _attributed_value_and_holdings (non-overlapping) to prevent
+        double-counting when portfolio tickers are each other's proxies.
+
+        Rebalancing sells always proceed (never blocked by wash-sale lookback).
+        If a sell would realize a wash-sale-disallowed loss, the sale executes
+        but the tax deduction is suppressed via tax_count_for_this_sale.
         """
         total_val = pf.nav(prices_today)
         if total_val <= 0:
             return
         # Sell overweight positions first
         for tk in tickers:
-            current_val, held = _sleeve_value_and_holdings(tk, prices_today)
+            current_val, held = _attributed_value_and_holdings(tk, prices_today)
             target_val = total_val * weight_map[tk]
             if current_val > target_val + 1.0:  # sell excess
                 dollars_to_sell = current_val - target_val
@@ -866,18 +893,24 @@ def run_optimizer_simulation(
                     if px <= 0:
                         continue
                     sh_to_sell = min(held_sh, dollars_to_sell / px)
+                    # Wash-sale aware: sell always proceeds, but suppress tax
+                    # deduction for losses that would be IRS-disallowed.
+                    def _ws_tax_filter(gain, gain_type, _htk=held_tk):
+                        if gain >= 0:
+                            return True  # gains always count
+                        return not wash_tracker.is_loss_sale_blocked(_htk, dt)
                     pf.sell(dt, held_tk, sh_to_sell, px, lot_selection="TAX_OPTIMAL",
                             reason=f"{reason_prefix}_SELL_FOR:{tk}",
                             on_loss_realized=_on_loss_realized,
-                            check_wash_sale_lookback=_check_wash_sale_lookback)
+                            tax_count_for_this_sale=_ws_tax_filter)
                     dollars_to_sell -= sh_to_sell * px
 
         # Recalculate NAV after sells (cash increased)
         total_val = pf.nav(prices_today)
 
-        # Buy underweight positions
+        # Buy underweight positions (use attributed values for accurate targets)
         for tk in tickers:
-            current_val, _ = _sleeve_value_and_holdings(tk, prices_today)
+            current_val, _ = _attributed_value_and_holdings(tk, prices_today)
             target_val = total_val * weight_map[tk]
             if target_val > current_val + 1.0:
                 buy_sym = _resolve_buy_symbol(tk, dt)
@@ -1007,7 +1040,7 @@ def run_optimizer_simulation(
             total_nav = pf.nav(prices_today)
             if total_nav > 0:
                 current_weights = {
-                    tk: _sleeve_value_and_holdings(tk, prices_today)[0] / total_nav
+                    tk: _attributed_value_and_holdings(tk, prices_today)[0] / total_nav
                     for tk in tickers
                 }
                 drift = _compute_drift(current_weights, weight_map, drift_mode)
