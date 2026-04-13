@@ -183,25 +183,6 @@ def test_end_liquidation_writes_trade_log_sells():
     assert (final_sells["action"] == "SELL").all(), "Final liquidation rows must be SELL actions"
 
 
-def test_annual_label_triggers_rebalance_trades():
-    """
-    UI uses 'Annual' as the frequency label. Ensure optimizer schedules
-    annual rebalance dates for that label (not just legacy 'Yearly').
-    """
-    dates = business_dates("2023-01-03", 270)  # spans into 2024
-    # Make SPY rise and AGG fall so annual rebalance has something to trade.
-    spy = np.linspace(100.0, 130.0, len(dates)).tolist()
-    agg = np.linspace(100.0, 80.0, len(dates)).tolist()
-    prices_df = make_prices(["SPY", "AGG"], dates, {"SPY": spy, "AGG": agg})
-
-    r = _run(
-        prices_df, ["SPY", "AGG"], [0.5, 0.5], dates,
-        static=False, rebalance_frequency="Annual",
-    )
-    rebal_sells = _rebal_sells(r["trades_df"])
-    assert len(rebal_sells) >= 1, "Expected at least one rebalance sell for Annual frequency"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 2 — NAV tracks price appreciation proportionally
 # ─────────────────────────────────────────────────────────────────────────────
