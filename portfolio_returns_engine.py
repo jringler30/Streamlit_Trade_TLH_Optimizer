@@ -1007,6 +1007,9 @@ if run_btn:
                     proxy_df=_proxy_df_ui,
                     wash_sale_days=int(_wash_sale_days_ui),
                     tlh_threshold_mode=_tlh_mode_ui,
+                    drift_tolerance=default_tolerance_pct / 100.0 if enable_threshold_rebal else None,
+                    drift_mode=drift_mode,
+                    drift_cooldown=cooldown_days,
                     compute_tax_alpha=True,
                 )
             except Exception as e:
