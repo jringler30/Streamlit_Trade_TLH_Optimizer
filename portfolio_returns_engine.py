@@ -989,6 +989,7 @@ if run_btn:
                     wash_sale_days=int(_wash_sale_days_ui),
                     tlh_threshold_mode=_tlh_mode_ui,
                     compute_tax_alpha=True,
+                    liquidate_at_end=True,
                 )
             except Exception as e:
                 st.error(f"TLH simulation failed: {e}")
@@ -1011,6 +1012,7 @@ if run_btn:
                     drift_mode=drift_mode,
                     drift_cooldown=cooldown_days,
                     compute_tax_alpha=True,
+                    liquidate_at_end=True,
                 )
             except Exception as e:
                 st.error(f"Rebalanced + TLH simulation failed: {e}")
