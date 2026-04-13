@@ -212,6 +212,12 @@ def load_proxy_lookup():
         proxy_df["symbol"] = proxy_df["symbol"].astype(str).str.strip().str.upper()
         proxy_df["lookup_symbol"] = proxy_df["lookup_symbol"].astype(str).str.strip().str.upper()
         proxy_df["order"] = pd.to_numeric(proxy_df["order"], errors="coerce").astype("Int64")
+        # If snapshot dates are provided, use only the latest snapshot to avoid
+        # mixing stale proxy mappings from older as_of_date rows.
+        if "as_of_date" in proxy_df.columns:
+            _asof = pd.to_datetime(proxy_df["as_of_date"], errors="coerce")
+            if _asof.notna().any():
+                proxy_df = proxy_df.loc[_asof == _asof.max()].copy()
         # Drop rows with missing critical fields
         proxy_df = proxy_df.dropna(subset=["symbol", "lookup_symbol", "order"])
         return proxy_df

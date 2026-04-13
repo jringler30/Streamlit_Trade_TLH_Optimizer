@@ -682,30 +682,49 @@ def _build_rebalance_set(trading_dates, freq: str):
     dates = pd.DatetimeIndex(trading_dates)
     if len(dates) < 2 or freq == "None":
         return set()
-    if freq == "Daily":
+    freq_norm = str(freq).strip()
+    # UI labels + legacy aliases
+    if freq_norm == "Yearly":
+        freq_norm = "Annual"
+    if freq_norm == "Daily":
         return set(dates[1:])
     rebal = set()
     prev_m, prev_y = dates[0].month, dates[0].year
     prev_w = dates[0].isocalendar()[1]
+    base_year = dates[0].year
+    last_rebal_year = base_year
     for dt in dates[1:]:
-        if freq == "Weekly":
+        if freq_norm == "Weekly":
             w = dt.isocalendar()[1]
             if w != prev_w or dt.year != prev_y:
                 rebal.add(dt)
                 prev_w = w; prev_y = dt.year
-        elif freq == "Monthly":
+        elif freq_norm == "Monthly":
             if dt.month != prev_m or dt.year != prev_y:
                 rebal.add(dt)
                 prev_m = dt.month; prev_y = dt.year
-        elif freq == "Quarterly":
+        elif freq_norm == "Quarterly":
             if dt.month in {1, 4, 7, 10} and (dt.month != prev_m or dt.year != prev_y):
                 rebal.add(dt)
             if dt.month != prev_m or dt.year != prev_y:
                 prev_m = dt.month; prev_y = dt.year
-        elif freq == "Yearly":
+        elif freq_norm == "6 Month":
+            if dt.month in {1, 7} and (dt.month != prev_m or dt.year != prev_y):
+                rebal.add(dt)
+            if dt.month != prev_m or dt.year != prev_y:
+                prev_m = dt.month; prev_y = dt.year
+        elif freq_norm == "Annual":
             if dt.year != prev_y:
                 rebal.add(dt)
                 prev_m = dt.month; prev_y = dt.year
+        elif freq_norm == "2 Year":
+            if dt.year != last_rebal_year and (dt.year - base_year) % 2 == 0:
+                rebal.add(dt)
+                last_rebal_year = dt.year
+        elif freq_norm == "5 Year":
+            if dt.year != last_rebal_year and (dt.year - base_year) % 5 == 0:
+                rebal.add(dt)
+                last_rebal_year = dt.year
     return rebal
 
 
