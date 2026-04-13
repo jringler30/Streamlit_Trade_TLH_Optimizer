@@ -1560,12 +1560,17 @@ if opt:
     # ── 2. Portfolio NAV Over Time (3-line: B&H + Static TLH + Optimized) ───
     # Blue = Buy & Hold (pre-tax benchmark), Grey = Static TLH, Orange = Optimized
     st.markdown("#### Portfolio NAV Over Time")
+    # Use the union of all indices so no date is dropped. Each series is
+    # forward-filled (then back-filled for any leading NaN at the union start)
+    # so the chart always covers the full simulation window including any
+    # early drawdown periods that would be hidden by .dropna().
     _bh_nav_opt = daily["Portfolio Value"].reindex(o_nav.index).ffill()
+    _opt_chart_index = s_nav.index.union(o_nav.index).union(_bh_nav_opt.index)
     _opt_chart_base = pd.DataFrame({
-        "Buy & Hold (benchmark)": _bh_nav_opt,
-        "TLH Only (after-tax)": s_nav,
-        "Rebalanced + TLH (after-tax)": o_nav,
-    }).dropna()
+        "Buy & Hold (benchmark)": _bh_nav_opt.reindex(_opt_chart_index).ffill().bfill(),
+        "TLH Only (after-tax)": s_nav.reindex(_opt_chart_index).ffill().bfill(),
+        "Rebalanced + TLH (after-tax)": o_nav.reindex(_opt_chart_index).ffill().bfill(),
+    })
     st.line_chart(
         _safe_chart_cols(_opt_chart_base),
         color=["#1a73e8", "#888888", "#e8710a"],
@@ -1578,14 +1583,23 @@ if opt:
     )
 
     # ── 3. Drawdown Over Time ────────────────────────────────────────────────
+    # Compute drawdown independently per series using each series' own full
+    # index so the running peak is never reset by a clipped start date.
     st.markdown("#### Drawdown Over Time")
-    _opt_dd_df = pd.DataFrame(index=_opt_chart_base.index)
     _opt_dd_colors = ["#1a73e8", "#888888", "#e8710a"]
-    for _col in _opt_chart_base.columns:
-        _v = _opt_chart_base[_col].values
+    _dd_series = {}
+    for _lbl_dd, _nav_dd in [
+        ("Buy & Hold (benchmark)", _bh_nav_opt),
+        ("TLH Only (after-tax)", s_nav),
+        ("Rebalanced + TLH (after-tax)", o_nav),
+    ]:
+        _v = _nav_dd.dropna().values
         _rm = np.maximum.accumulate(_v)
         _safe_rm = np.where(_rm > 0, _rm, 1.0)
-        _opt_dd_df[_col] = ((_v - _rm) / _safe_rm) * 100
+        _dd_series[_lbl_dd] = pd.Series(
+            ((_v - _rm) / _safe_rm) * 100, index=_nav_dd.dropna().index
+        )
+    _opt_dd_df = pd.DataFrame(_dd_series).ffill().bfill()
     st.area_chart(_safe_chart_cols(_opt_dd_df), color=_opt_dd_colors, use_container_width=True, height=280)
     st.caption("Drawdown (%) = distance below each portfolio's historical peak value.")
 
