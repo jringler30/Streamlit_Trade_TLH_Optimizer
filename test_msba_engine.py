@@ -79,7 +79,7 @@ def _run(prices_df, tickers, weights, dates,
          tlh_threshold=0.0, proxy_df=None,
          tax_rates=None, rebalance_frequency="None", cost_config=None,
          compute_tax_alpha=False, initial_capital=100_000.0, static=True,
-         wash_sale_days=30):
+         wash_sale_days=30, liquidate_at_end=False):
     """Thin wrapper with sensible test defaults."""
     return run_optimizer_simulation(
         prices_df=prices_df,
@@ -100,6 +100,7 @@ def _run(prices_df, tickers, weights, dates,
         wash_sale_days=wash_sale_days,
         tlh_threshold_mode="explicit",
         compute_tax_alpha=compute_tax_alpha,
+        liquidate_at_end=liquidate_at_end,
     )
 
 
@@ -161,6 +162,25 @@ def test_basic_buy_and_hold():
         "Expected 0 realized events on buy-and-hold"
     assert r["tax_paid_total"] == pytest.approx(0.0, abs=1e-6), \
         f"Expected zero tax paid, got ${r['tax_paid_total']:.4f}"
+
+
+def test_end_liquidation_writes_trade_log_sells():
+    """
+    When liquidate_at_end=True, the engine should append terminal SELL trades
+    so the trade log explicitly shows end-of-period liquidation.
+    """
+    dates = business_dates("2023-01-03", 10)
+    prices = np.linspace(100.0, 110.0, len(dates)).tolist()
+    prices_df = make_prices(["SPY"], dates, {"SPY": prices})
+
+    r = _run(
+        prices_df, ["SPY"], [1.0], dates,
+        liquidate_at_end=True,
+    )
+    trades = r["trades_df"]
+    final_sells = trades[trades["reason"].str.contains("FINAL_LIQUIDATION:", na=False)]
+    assert len(final_sells) >= 1, "Expected terminal liquidation SELL in trade log"
+    assert (final_sells["action"] == "SELL").all(), "Final liquidation rows must be SELL actions"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
