@@ -856,10 +856,21 @@ def run_optimizer_simulation(
     sub = sub.drop_duplicates(subset=["TICKERSYMBOL", "PRICEDATE"])
     wide = sub.pivot(index="PRICEDATE", columns="TICKERSYMBOL", values=price_field)
     wide = wide.sort_index().ffill()
-    # Drop rows where any ticker still lacks a price (i.e., its history starts after
-    # the requested start date). Backward fill is intentionally omitted — it would
-    # propagate future prices into earlier dates, introducing lookahead bias.
-    wide = wide.dropna()
+    # Drop rows where any CORE portfolio ticker lacks a price (i.e., its history
+    # starts after the requested start date). Proxy tickers are intentionally
+    # excluded from this check — they may have later inception dates, and including
+    # them in dropna() silently trims the simulation window forward, hiding
+    # historical drawdown periods and causing Tax Alpha 2 to appear as $+0
+    # (no losses occur in the truncated bull-market window).
+    # Backward fill is intentionally omitted — it would propagate future prices
+    # into earlier dates, introducing lookahead bias.
+    _core_cols = [t for t in tickers if t in wide.columns]
+    wide = wide.dropna(subset=_core_cols)
+    # Zero-fill proxy columns for any remaining NaN (pre-inception dates).
+    # The px <= 0 guard in the TLH loop will skip these cleanly.
+    _proxy_only_cols = [c for c in wide.columns if c not in set(tickers)]
+    if _proxy_only_cols:
+        wide[_proxy_only_cols] = wide[_proxy_only_cols].fillna(0.0)
     if wide.empty:
         raise ValueError(
             "No common trading dates found for all tickers after forward-fill. "
