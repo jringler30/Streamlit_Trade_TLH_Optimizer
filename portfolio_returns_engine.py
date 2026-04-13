@@ -459,8 +459,25 @@ if _OPTIMIZER_AVAILABLE:
                 proxy_lookup_full["symbol"].isin(ticker_inputs)
             ].copy()
             if not _matching_proxies.empty:
+                # Drop any proxy rows whose lookup_symbol has no price data in the
+                # loaded dataset. Without this, missing proxies cause NaN columns in
+                # the wide price matrix which — before our core dropna fix — silently
+                # trimmed the simulation date range forward.
+                _available_tickers = set(df["TICKERSYMBOL"].str.upper().unique()) if "TICKERSYMBOL" in df.columns else set()
+                _missing_proxies = _matching_proxies[
+                    ~_matching_proxies["lookup_symbol"].isin(_available_tickers)
+                ]["lookup_symbol"].unique().tolist()
+                if _missing_proxies:
+                    st.sidebar.warning(
+                        f"⚠️ Proxy tickers not in price data and will be ignored: "
+                        f"{', '.join(_missing_proxies)}"
+                    )
+                _matching_proxies = _matching_proxies[
+                    _matching_proxies["lookup_symbol"].isin(_available_tickers)
+                ]
+
                 # Include lookup_type (required by ProxyResolver in optimizer)
-                _proxy_df_ui = _matching_proxies[["symbol", "lookup_type", "lookup_symbol", "order"]]
+                _proxy_df_ui = _matching_proxies[["symbol", "lookup_type", "lookup_symbol", "order"]] if not _matching_proxies.empty else None
 
                 # Display proxy info in sidebar
                 st.sidebar.markdown("**TLH Proxy Tickers** *(auto-loaded from proxy_lookup.csv)*")
@@ -759,7 +776,9 @@ if run_btn:
             _comparison_df["Buy & Hold"] = _daily["Portfolio Value"].reindex(_comparison_df.index)
             for _lbl, (_rd2, _rs2) in _strategy_results.items():
                 _comparison_df[_lbl] = _rd2["Portfolio Value"].reindex(_comparison_df.index)
-            _comparison_df = _comparison_df.dropna()
+            # Use ffill/bfill instead of dropna so early drawdown periods are not
+            # clipped when any strategy's series starts slightly later than others.
+            _comparison_df = _comparison_df.ffill().bfill().dropna(how="all")
 
             _bh_vals_arr = _comparison_df["Buy & Hold"].values
             _comp_dates = _comparison_df.index  # DatetimeIndex for date-aware CAGR
@@ -1608,18 +1627,22 @@ if opt:
     # ── 4. Performance Metrics Table ─────────────────────────────────────────
     # Compute the same metrics as the rebalancing section for each scenario
     # so both sections show identical columns in identical order.
+    # Use a shared date index (union of all three series) so every scenario is
+    # measured over the same horizon and CAGR/Sharpe are annualized consistently.
     st.markdown("#### Performance Metrics")
+    _shared_idx = s_nav.dropna().index.union(o_nav.dropna().index).union(_bh_nav_opt.dropna().index)
     _opt_metrics_rows = []
     for _lbl_m, _nav_m in [
         ("Buy & Hold", _bh_nav_opt),
         ("TLH Only", s_nav),
         ("Rebalanced + TLH", o_nav),
     ]:
-        _nav_arr = _nav_m.dropna().values
-        _nav_dates = _nav_m.dropna().index
+        _nav_aligned = _nav_m.reindex(_shared_idx).ffill().bfill()
+        _nav_arr = _nav_aligned.dropna().values
+        _nav_dates = _nav_aligned.dropna().index
         if len(_nav_arr) < 2:
             continue
-        _bh_arr_bench = _bh_nav_opt.reindex(_nav_dates).ffill().values
+        _bh_arr_bench = _bh_nav_opt.reindex(_nav_dates).ffill().bfill().values
         _is_bh = _lbl_m == "Buy & Hold"
         _m_opt = compute_strategy_metrics(
             _nav_arr, cap,

@@ -1259,7 +1259,19 @@ def run_optimizer_simulation(
             liquidate_at_end=liquidate_at_end,
         )
         nav_no_tlh = base["nav_series"].reindex(nav_series.index).ffill()
-        tax_alpha_2 = nav_series - nav_no_tlh
+
+        # Guard: if the baseline series started later than the TLH series,
+        # reindex+ffill will leave leading NaNs that corrupt tax_alpha_2.
+        # Drop any dates where the baseline is still NaN after ffill and
+        # recompute on the aligned intersection only.
+        _valid_mask = nav_no_tlh.notna()
+        if not _valid_mask.all():
+            nav_series_aligned = nav_series[_valid_mask]
+            nav_no_tlh = nav_no_tlh[_valid_mask]
+        else:
+            nav_series_aligned = nav_series
+
+        tax_alpha_2 = nav_series_aligned - nav_no_tlh
 
         out.update({
             "nav_no_tlh": nav_no_tlh,
