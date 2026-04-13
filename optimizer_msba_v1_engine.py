@@ -229,6 +229,10 @@ class ProxyResolver:
         df["order"] = pd.to_numeric(df["order"], errors="coerce").astype("Int64")
         df = df.dropna(subset=["symbol", "lookup_symbol", "order"]).copy()
         df = df.sort_values(["symbol", "order", "lookup_symbol"])
+        # Deduplicate: proxy_lookup.csv may have the same (symbol, lookup_symbol)
+        # pair across multiple as_of_dates. Keep only the first occurrence per pair
+        # to prevent sleeve_all_tickers() from counting proxy positions multiple times.
+        df = df.drop_duplicates(subset=["symbol", "lookup_symbol"], keep="first")
         for sym, g in df.groupby("symbol", sort=False):
             self._map[sym] = g["lookup_symbol"].tolist()
 
@@ -1057,7 +1061,11 @@ def run_optimizer_simulation(
                     # No proxy_df loaded, skip TLH for all tickers
                     continue
 
-                # Check ALL sleeve tickers (original + proxies) for harvestable lots
+                # Check ALL sleeve tickers (original + proxies) for harvestable lots.
+                # Guard: only harvest a lot if a valid rebuy exists (a non-blocked sleeve
+                # ticker other than the one being sold). Without this, harvesting a proxy
+                # lot whose only rebuy is the wash-sale-blocked original sends proceeds to
+                # idle cash — paying transaction costs with no market exposure in return.
                 sleeve_tickers = proxy_resolver.sleeve_all_tickers(tk)
                 lots_to_harvest = []  # (sell_ticker, lot_id, lot_shares)
                 for stk in sleeve_tickers:
@@ -1069,7 +1077,15 @@ def run_optimizer_simulation(
                             continue
                         unrealized_pct = (px - lot["cost_basis"]) / lot["cost_basis"]
                         if unrealized_pct <= -tlh_threshold:
-                            lots_to_harvest.append((stk, lot["lot_id"], lot["shares"]))
+                            # Only queue this lot if a valid rebuy candidate exists
+                            has_rebuy = any(
+                                c != stk
+                                and not wash_tracker.is_buy_blocked(c, dt)
+                                and prices_today.get(c, 0.0) > 0
+                                for c in sleeve_tickers
+                            )
+                            if has_rebuy:
+                                lots_to_harvest.append((stk, lot["lot_id"], lot["shares"]))
 
                 for sell_tk, lot_id, lot_shares in lots_to_harvest:
                     tlh_fired_today = True  # suppress drift check this day
