@@ -682,30 +682,49 @@ def _build_rebalance_set(trading_dates, freq: str):
     dates = pd.DatetimeIndex(trading_dates)
     if len(dates) < 2 or freq == "None":
         return set()
-    if freq == "Daily":
+    freq_norm = str(freq).strip()
+    # UI labels + legacy aliases
+    if freq_norm == "Yearly":
+        freq_norm = "Annual"
+    if freq_norm == "Daily":
         return set(dates[1:])
     rebal = set()
     prev_m, prev_y = dates[0].month, dates[0].year
     prev_w = dates[0].isocalendar()[1]
+    base_year = dates[0].year
+    last_rebal_year = base_year
     for dt in dates[1:]:
-        if freq == "Weekly":
+        if freq_norm == "Weekly":
             w = dt.isocalendar()[1]
             if w != prev_w or dt.year != prev_y:
                 rebal.add(dt)
                 prev_w = w; prev_y = dt.year
-        elif freq == "Monthly":
+        elif freq_norm == "Monthly":
             if dt.month != prev_m or dt.year != prev_y:
                 rebal.add(dt)
                 prev_m = dt.month; prev_y = dt.year
-        elif freq == "Quarterly":
+        elif freq_norm == "Quarterly":
             if dt.month in {1, 4, 7, 10} and (dt.month != prev_m or dt.year != prev_y):
                 rebal.add(dt)
             if dt.month != prev_m or dt.year != prev_y:
                 prev_m = dt.month; prev_y = dt.year
-        elif freq == "Yearly":
+        elif freq_norm == "6 Month":
+            if dt.month in {1, 7} and (dt.month != prev_m or dt.year != prev_y):
+                rebal.add(dt)
+            if dt.month != prev_m or dt.year != prev_y:
+                prev_m = dt.month; prev_y = dt.year
+        elif freq_norm == "Annual":
             if dt.year != prev_y:
                 rebal.add(dt)
                 prev_m = dt.month; prev_y = dt.year
+        elif freq_norm == "2 Year":
+            if dt.year != last_rebal_year and (dt.year - base_year) % 2 == 0:
+                rebal.add(dt)
+                last_rebal_year = dt.year
+        elif freq_norm == "5 Year":
+            if dt.year != last_rebal_year and (dt.year - base_year) % 5 == 0:
+                rebal.add(dt)
+                last_rebal_year = dt.year
     return rebal
 
 
@@ -769,6 +788,7 @@ def run_optimizer_simulation(
     drift_mode: str = "Absolute",
     drift_cooldown: int = 0,
     forced_rebalance_dates: Optional[set] = None,
+    liquidate_at_end: bool = False,
 ) -> dict:
     """
     Run the MSBA v1 tax-aware portfolio simulation.
@@ -793,6 +813,8 @@ def run_optimizer_simulation(
     drift_cooldown     : days to suppress drift re-triggers after a drift rebalance
     forced_rebalance_dates : optional set of dates to force rebalancing (e.g. from
                         pre-computed threshold triggers); merged with rebal_dates
+    liquidate_at_end   : if True, force liquidation on final date and record
+                        FINAL_LIQUIDATION sells in the trade log
 
     Returns
     -------
@@ -1141,6 +1163,26 @@ def run_optimizer_simulation(
         # 5. Record NAV
         nav_arr[i] = pf.nav(prices_today)
 
+    # Optional terminal liquidation: realize all remaining lots on the final date.
+    # This writes explicit end-of-period SELL rows into trades_df.
+    if liquidate_at_end:
+        end_dt = trading_dates[-1]
+        end_prices = {tk: float(wide.loc[end_dt, tk]) for tk in all_needed_list}
+        lots_to_close: List[Tuple[str, str, float]] = []
+        for lot in pf._lots:
+            sh = float(lot.get("shares", 0.0))
+            if sh > 1e-12:
+                lots_to_close.append((str(lot["ticker"]), str(lot["lot_id"]), sh))
+        for tk, lot_id, sh in lots_to_close:
+            px = float(end_prices.get(tk, 0.0))
+            if px <= 0:
+                continue
+            pf.sell(
+                end_dt, tk, sh, px,
+                lot_ids=[lot_id],
+                reason=f"FINAL_LIQUIDATION:{tk}",
+            )
+
     # FIX 2: Settle any remaining tax liability accrued in the final (partial) year.
     pf.settle_annual_taxes()
 
@@ -1203,6 +1245,7 @@ def run_optimizer_simulation(
             drift_mode=drift_mode,
             drift_cooldown=drift_cooldown,
             forced_rebalance_dates=forced_rebalance_dates,
+            liquidate_at_end=liquidate_at_end,
         )
         nav_no_tlh = base["nav_series"].reindex(nav_series.index).ffill()
         tax_alpha_2 = nav_series - nav_no_tlh

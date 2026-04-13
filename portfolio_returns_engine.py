@@ -212,6 +212,12 @@ def load_proxy_lookup():
         proxy_df["symbol"] = proxy_df["symbol"].astype(str).str.strip().str.upper()
         proxy_df["lookup_symbol"] = proxy_df["lookup_symbol"].astype(str).str.strip().str.upper()
         proxy_df["order"] = pd.to_numeric(proxy_df["order"], errors="coerce").astype("Int64")
+        # If snapshot dates are provided, use only the latest snapshot to avoid
+        # mixing stale proxy mappings from older as_of_date rows.
+        if "as_of_date" in proxy_df.columns:
+            _asof = pd.to_datetime(proxy_df["as_of_date"], errors="coerce")
+            if _asof.notna().any():
+                proxy_df = proxy_df.loc[_asof == _asof.max()].copy()
         # Drop rows with missing critical fields
         proxy_df = proxy_df.dropna(subset=["symbol", "lookup_symbol", "order"])
         return proxy_df
@@ -989,6 +995,7 @@ if run_btn:
                     wash_sale_days=int(_wash_sale_days_ui),
                     tlh_threshold_mode=_tlh_mode_ui,
                     compute_tax_alpha=True,
+                    liquidate_at_end=True,
                 )
             except Exception as e:
                 st.error(f"TLH simulation failed: {e}")
@@ -1011,6 +1018,7 @@ if run_btn:
                     drift_mode=drift_mode,
                     drift_cooldown=cooldown_days,
                     compute_tax_alpha=True,
+                    liquidate_at_end=True,
                 )
             except Exception as e:
                 st.error(f"Rebalanced + TLH simulation failed: {e}")
@@ -1032,6 +1040,7 @@ if run_btn:
                 _oi_used = _res_o.get("ordinary_income_offset_used_ytd_final", np.nan)
                 _cf_st = _res_o.get("loss_carryforward_st", np.nan)
                 _cf_lt = _res_o.get("loss_carryforward_lt", np.nan)
+                _liq_nav = _res_o.get("liquidation_nav", np.nan)
                 _tlh_rows_opt.append({
                     "Scenario": _lbl_o,
                     "TLH Events (loss lots)": _tlh_ev,
@@ -1046,6 +1055,7 @@ if run_btn:
                     "Loss CF (ST)": f"${_cf_st:,.0f}" if np.isfinite(_cf_st) else "—",
                     "Loss CF (LT)": f"${_cf_lt:,.0f}" if np.isfinite(_cf_lt) else "—",
                     "Final NAV ($)": f"${_res_o['nav_series'].iloc[-1]:,.0f}",
+                    "Liquidation NAV ($)": f"${_liq_nav:,.0f}" if np.isfinite(_liq_nav) else "—",
                 })
             _tlh_df_opt = pd.DataFrame(_tlh_rows_opt)
             _opt = {
