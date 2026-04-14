@@ -119,7 +119,7 @@ GDRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
 @st.cache_data(show_spinner=True)
 def ensure_data():
     if not DATA_PATH.exists():
-        out = gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False, fuzzy=True)
+        out = gdown.download(GDRIVE_URL, str(DATA_PATH), quiet=False)
         if out is None or not DATA_PATH.exists():
             st.error("Google Drive download failed (permissions/quota/bad link).")
             st.stop()
