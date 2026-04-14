@@ -1553,10 +1553,9 @@ if opt:
         _total_divs_opt = float(_tdf_opt.loc[_drip_mask, "gross_value"].sum())
 
     # ── 1. KPI Cards ─────────────────────────────────────────────────────────
-    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+    kc1, kc2, kc4, kc5 = st.columns(4)
     kc1.metric("TLH Only — Final NAV", f"${s_final:,.0f}", delta=f"{(s_final/cap - 1):+.2%}")
     kc2.metric("Rebalanced + TLH — Final NAV", f"${o_final:,.0f}", delta=f"{(o_final/cap - 1):+.2%}")
-    kc3.metric("Rebal+TLH vs TLH Only", f"${o_final - s_final:+,.0f}", delta=f"{((o_final - s_final)/cap):+.4%}")
     kc4.metric("Total Tax Paid (Rebal+TLH)", f"${opt_result_d['tax_paid_total']:,.0f}",
                delta=f"TLH Only: ${static_result_d['tax_paid_total']:,.0f}")
     kc5.metric(
