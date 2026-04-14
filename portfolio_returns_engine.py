@@ -1053,7 +1053,6 @@ if run_btn:
                 # Legacy estimate retained for reference; engine now also returns tax alpha series.
                 _tax_saved_o = _losses_h * _opt_tax_rates.get("st_rate", 0.35)
                 _tx_cost_o = _res_o.get("transaction_costs_total", 0.0)
-                _net_ben = _tax_saved_o - _tx_cost_o - _res_o.get("tax_paid_total", 0.0)
                 _ta2 = _res_o.get("tax_alpha_2_final", np.nan)
                 _ta2_pct = (_ta2 / float(initial_capital)) if (isinstance(_ta2, (int, float)) and float(initial_capital) > 0) else np.nan
                 _oi_used = _res_o.get("ordinary_income_offset_used_ytd_final", np.nan)
@@ -1067,7 +1066,6 @@ if run_btn:
                     "Est. Tax Savings ($)": f"${_tax_saved_o:,.0f}",
                     "Tax Paid ($)": f"${_res_o.get('tax_paid_total', 0.0):,.0f}",
                     "Exec Costs ($)": f"${_tx_cost_o:,.0f}",
-                    "Net Benefit ($)": f"${_net_ben:+,.0f}",
                     "Tax Alpha 2 ($)": f"${_ta2:+,.0f}" if np.isfinite(_ta2) else "—",
                     "Tax Alpha 2 (% cap)": f"{_ta2_pct:+.2%}" if np.isfinite(_ta2_pct) else "—",
                     "Ordinary Offset Used (YTD, $<=3000)": f"${_oi_used:,.0f}" if np.isfinite(_oi_used) else "—",
@@ -1728,7 +1726,6 @@ if opt:
         "**Tax Alpha 2** = (TLH portfolio NAV) − (identical portfolio NAV without TLH). "
         "Measures the actual dollar advantage that tax-loss harvesting created relative to "
         "an identical strategy that never harvested. A positive value means TLH added value. "
-        "**Net Benefit** = Est. Tax Savings − Tax Paid − Execution Costs (rough estimate). "
         "**Modeling notes:** Dividends are taxed at the long-term capital gains rate (qualified "
         "dividend assumption). The Buy & Hold benchmark uses price-only returns. "
         "Wash-sale avoidance is modeled via proxy substitution."
