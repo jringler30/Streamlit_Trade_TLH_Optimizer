@@ -1593,6 +1593,56 @@ if opt:
         "**Orange:** Rebalanced + TLH (after-tax)."
     )
 
+    # ── 2b. Portfolio Value vs Cost Basis ────────────────────────────────────
+    # Cost basis = sum of gross purchase cost of all currently-open lots.
+    # Rising NAV with flat/falling cost basis = growing unrealized gains.
+    # NAV near cost basis = TLH opportunities (lots close to harvesting threshold).
+    def _build_cost_basis_series(trades_df_in, realized_df_in, idx):
+        cb = pd.Series(0.0, index=idx)
+        if not trades_df_in.empty and "action" in trades_df_in.columns and "gross_value" in trades_df_in.columns:
+            buys = trades_df_in[trades_df_in["action"] != "SELL"].copy()
+            if not buys.empty:
+                buys["trade_date"] = pd.to_datetime(buys["trade_date"])
+                b_daily = buys.groupby("trade_date")["gross_value"].sum()
+                b_daily = b_daily.reindex(idx, fill_value=0.0)
+                cb = cb + b_daily.cumsum()
+        if not realized_df_in.empty and "cost_basis" in realized_df_in.columns and "event_date" in realized_df_in.columns:
+            sells = realized_df_in.copy()
+            sells["event_date"] = pd.to_datetime(sells["event_date"])
+            s_daily = sells.groupby("event_date")["cost_basis"].sum()
+            s_daily = s_daily.reindex(idx, fill_value=0.0)
+            cb = cb - s_daily.cumsum()
+        return cb
+
+    _cb_index = _opt_chart_index
+    _o_cb = _build_cost_basis_series(
+        opt_result_d.get("trades_df", pd.DataFrame()),
+        opt_result_d.get("realized_df", pd.DataFrame()),
+        _cb_index,
+    )
+    _s_cb = _build_cost_basis_series(
+        static_result_d.get("trades_df", pd.DataFrame()),
+        static_result_d.get("realized_df", pd.DataFrame()),
+        _cb_index,
+    )
+    _cb_chart_df = pd.DataFrame({
+        "TLH Only — NAV": s_nav.reindex(_cb_index).ffill().bfill(),
+        "TLH Only — Cost Basis": _s_cb,
+        "Rebal+TLH — NAV": o_nav.reindex(_cb_index).ffill().bfill(),
+        "Rebal+TLH — Cost Basis": _o_cb,
+    })
+    st.markdown("#### Portfolio Value vs. Cost Basis Over Time")
+    st.line_chart(
+        _safe_chart_cols(_cb_chart_df),
+        color=["#888888", "#4a4a4a", "#e8710a", "#f4b56a"],
+        use_container_width=True, height=350,
+    )
+    st.caption(
+        "**Solid (bright):** after-tax portfolio NAV. "
+        "**Muted:** aggregate cost basis of all open lots. "
+        "The gap above cost basis = unrealized gains; gap below = unrealized losses (prime TLH territory)."
+    )
+
     # ── 3. Drawdown Over Time ────────────────────────────────────────────────
     # Compute drawdown independently per series using each series' own full
     # index so the running peak is never reset by a clipped start date.
