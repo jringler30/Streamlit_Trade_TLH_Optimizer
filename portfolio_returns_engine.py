@@ -1066,8 +1066,8 @@ if run_btn:
                     "Est. Tax Savings ($)": f"${_tax_saved_o:,.0f}",
                     "Tax Paid ($)": f"${_res_o.get('tax_paid_total', 0.0):,.0f}",
                     "Exec Costs ($)": f"${_tx_cost_o:,.0f}",
-                    "Tax Alpha 2 ($)": f"${_ta2:+,.0f}" if np.isfinite(_ta2) else "—",
-                    "Tax Alpha 2 (% cap)": f"{_ta2_pct:+.2%}" if np.isfinite(_ta2_pct) else "—",
+                    "Tax Alpha ($)": f"${_ta2:+,.0f}" if np.isfinite(_ta2) else "—",
+                    "Tax Alpha (% cap)": f"{_ta2_pct:+.2%}" if np.isfinite(_ta2_pct) else "—",
                     "Ordinary Offset Used (YTD, $<=3000)": f"${_oi_used:,.0f}" if np.isfinite(_oi_used) else "—",
                     "Loss CF (ST)": f"${_cf_st:,.0f}" if np.isfinite(_cf_st) else "—",
                     "Loss CF (LT)": f"${_cf_lt:,.0f}" if np.isfinite(_cf_lt) else "—",
@@ -1723,7 +1723,7 @@ if opt:
             label="TLH & Tax Summary", sheet_name="TLH Summary",
         )
     st.caption(
-        "**Tax Alpha 2** = (TLH portfolio NAV) − (identical portfolio NAV without TLH). "
+        "**Tax Alpha** = (TLH portfolio NAV) − (identical portfolio NAV without TLH). "
         "Measures the actual dollar advantage that tax-loss harvesting created relative to "
         "an identical strategy that never harvested. A positive value means TLH added value. "
         "**Modeling notes:** Dividends are taxed at the long-term capital gains rate (qualified "
