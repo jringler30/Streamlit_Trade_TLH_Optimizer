@@ -1324,14 +1324,6 @@ if rebal["enabled"]:
         st.area_chart(_safe_chart_cols(dd_chart_df), color=strategy_colors, use_container_width=True, height=280)
         st.caption("Drawdown (%) = distance below each strategy's historical peak value.")
 
-        # ── 4. Strategy vs B&H dollar difference ────────────────────────────
-        if primary_label in comparison_df.columns:
-            diff_series = comparison_df[primary_label] - comparison_df["Buy & Hold"]
-            diff_chart = pd.DataFrame({f"{primary_label} vs B&H ($)": diff_series})
-            advantage_color = "#34a853" if diff_series.iloc[-1] >= 0 else "#ea4335"
-            st.area_chart(_safe_chart_cols(diff_chart), color=[advantage_color], use_container_width=True, height=180)
-            st.caption(f"Dollar advantage of **{primary_label}** over Buy & Hold over time.")
-
         st.markdown("---")
 
         # ── 5. Performance Metrics Table ─────────────────────────────────────
